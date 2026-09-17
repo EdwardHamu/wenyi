@@ -2,9 +2,9 @@
 
 # 📚 Wenyi
 
-**One command, from EPUB to a readable Chinese translation.**
+**Local CLI agents, especially Pi CLI, powering a complete book-translation workflow.**
 
-Whole-book analysis · Real-time glossary · Multi-stage review
+Direct CLI invocation · Whole-book analysis · Real-time glossary · Multi-stage review
 
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square)](https://www.python.org/)
 [![Tests](https://img.shields.io/github/actions/workflow/status/BigDawnGhost/wenyi/tests.yml?style=flat-square)](https://github.com/BigDawnGhost/wenyi/actions/workflows/tests.yml)
@@ -25,6 +25,8 @@ Whole-book analysis · Real-time glossary · Multi-stage review
 - [Why Wenyi](#why-wenyi)
 - [Core features](#core-features)
 - [Quick start](#quick-start)
+  - [Wenyi configuration](#wenyi-configuration-yaml-not-an-agents-native-config)
+  - [Command syntax](#command-syntax-wenyi-vs-the-underlying-agent)
 - [Supported formats](#supported-formats)
 - [Translation pipeline](#translation-pipeline)
 - [Documentation](#documentation)
@@ -44,7 +46,9 @@ Whole-book analysis · Real-time glossary · Multi-stage review
 | Single-pass translation, fragile to interruptions | Batch checkpoints and chapter status tracking: resume any interrupted run with the same command |
 | Raw model output, no systematic quality process | Translate → polish → evidence-driven whole-book review |
 
-Wenyi is designed for **long-form texts** — novels, social-science monographs, narrative nonfiction, and more.
+Wenyi is designed for **long-form texts** — novels, social-science monographs, narrative nonfiction, and more. Its primary workflow **directly invokes locally installed CLI agents, especially Pi CLI**, rather than requiring a separate HTTP API integration for every model. Wenyi handles parsing, context, terminology, translation, review, and export; the selected agent handles model access and authentication. Existing HTTP providers remain optional alternatives.
+
+**Supported deployment: clone this repository and run it locally, with the corresponding CLI agents already installed and authenticated.**
 
 ---
 
@@ -54,7 +58,8 @@ Wenyi is designed for **long-form texts** — novels, social-science monographs,
 - **Real-time glossary** — extracts proper names, terms, and recurring expressions as translation progresses; detects conflicting translations and surfaces them for resolution
 - **Multi-stage quality** — optional polishing (strong model) and an evidence-driven whole-book AI review
 - **Resumability** — batch-level checkpoints, chapter status tracking, and atomic state writes; interrupt at any point and resume with the same command
-- **Multiple LLM providers** — DeepSeek, OpenAI, OpenRouter, OrcaRouter, Google Gemini, Ollama, vLLM, and generic OpenAI-compatible endpoints
+- **CLI-agent-first model access** — Pi CLI (recommended), Codex, Claude Code (`provider: anthropic`), CodeBuddy Code, and Agy; existing HTTP providers remain available
+- **Wenyi-specific YAML routing** — `llm_list` + `llm_priority`, three workflow tiers, and per-tier provider overrides
 - **Native EPUB preservation** — writes translated text back into the original XHTML templates and attempts to preserve styles, images, TOC, and anchors
 - **Bilingual output** — optional source-and-translation edition with visually subdued source text, including dark mode support
 
@@ -62,25 +67,133 @@ Wenyi is designed for **long-form texts** — novels, social-science monographs,
 
 ## Quick start
 
-### Prerequisites
+### Prerequisites: install and authenticate your CLI agents first
 
-Wenyi requires Python 3.10+ and [uv](https://docs.astral.sh/uv/).
+**The only supported deployment is cloning this repository and running the source locally.** Do not use a standalone executable, a hosted web service, or a package-only installation as the supported setup. Wenyi does not bundle, install, or log in to CLI agents for you.
 
-### Installation
+Install Git, Python 3.10+, and [uv](https://docs.astral.sh/uv/), plus **every CLI agent used by your configuration**, including fallback entries and tier overrides. **Pi CLI is the recommended starting point**; Codex, Claude Code, CodeBuddy Code, and Agy are also integrated. Follow each agent's own installation and authentication instructions. The chosen models must already be available through that agent on this machine.
+
+For Pi, check the executable in the same terminal/account that will run Wenyi:
+
+```bash
+pi --version
+pi --help
+```
+
+Then complete Pi's login/provider/model setup and verify a small prompt directly with your chosen model. `--version` alone does not prove authentication or model access. Local execution does not mean offline inference: an agent may still contact its configured remote model service and consume quota.
+
+### Installation from source
 
 ```bash
 git clone https://github.com/BigDawnGhost/wenyi.git
 cd wenyi
-uv sync
+uv sync --locked
+uv run trans-novel --help
 ```
 
-### Configuration
+Run the examples below from the repository root. If the executable is not on `PATH`, set `cli_path` to its actual local path. On Windows, a YAML path such as `'C:\Program Files\nodejs\pi.cmd'` must match your installation; do not copy another user's path from the repository configuration. In PowerShell, a quoted executable path is invoked with `&`, for example `& 'C:\Program Files\nodejs\pi.cmd' --version`.
 
-Set your API key:
+### Wenyi configuration: YAML, not an agent's native config
+
+`config.yaml` is **Wenyi's own configuration format**. It controls the workflow, provider routing, models, and tiers; it is not Pi's native model/authentication file, a Codex TOML file, or a shell command. Configure credentials and custom model registrations inside the corresponding CLI agent first.
+
+The checked-in `config.yaml` contains machine-specific paths and model aliases. Edit it for your machine, or save the following minimal example as `config.local.yaml` and pass it explicitly. Replace every `YOUR_PROVIDER/YOUR_MODEL` with a model identifier accepted by your installed Pi CLI:
+
+```yaml
+language:
+  source: auto
+  target: zh
+
+llm_priority: "0"
+llm_list:
+  - provider: pi
+    cli_path: pi  # On PATH; or use the actual absolute executable path
+    timeout: 600
+    max_retries: 4
+    tiers:
+      strong:
+        model: "YOUR_PROVIDER/YOUR_MODEL"
+        options:
+          thinking: true
+          reasoning_effort: high
+      cheap:
+        model: "YOUR_PROVIDER/YOUR_MODEL"
+        options:
+          thinking: true
+          reasoning_effort: medium
+      fast:
+        model: "YOUR_PROVIDER/YOUR_MODEL"
+        options:
+          thinking: false
+
+pipeline:
+  polish: true
+  review: false
+
+output:
+  mono: true
+  bilingual: false
+```
+
+- **`llm_list`** contains 1–10 complete provider configurations, indexed from **0**. Each entry has its own `provider`, `cli_path`, `timeout` (seconds), `max_retries`, and `tiers`.
+- **`llm_priority`** must be a quoted string containing each entry's index exactly once. With three entries, `"021"` means entry 0 → entry 2 → entry 1, not model weights or tier names. With one entry use `"0"`; omission defaults to list order. Duplicate, missing, or out-of-range indices are invalid.
+- **Switching is not generic failover:** the current multi-configuration scheduler switches on `PiAuditError`, not every timeout, login error, or provider failure. After 600 seconds without another recorded audit event, a subsequent request can restore the first-priority entry. All configured agents must be installed and usable before starting; fallback is not a substitute for setup.
+- **`tiers.strong / cheap / fast`** are Wenyi workflow roles, not CLI subcommands or guaranteed price levels. `strong` handles analysis, body translation, and polishing; `cheap` is used for initial review and annotation alignment; `fast` is used for chapter/book summaries. Review Agent/Fixer selection also follows `pipeline.review_agent_tier`. Configure all three explicitly, even if they use the same model.
+- **Pi options:** `model` is passed unchanged to `pi --model`; it can be a Pi-recognized model ID or `provider/model` selector. Wenyi's `provider: pi` selects the CLI adapter, not the underlying model vendor. `thinking: true` maps `reasoning_effort` to `--thinking`; `thinking: false` sends `--thinking off`. Use a level supported by your Pi version and model.
+- **`cli_path` is only an executable path**, not `pi -p --model ...`. Omit it to discover the executable on `PATH`. With Pi, Codex, Claude Code, CodeBuddy, and Agy, authentication belongs to the CLI; Wenyi's `base_url` / `api_key_env` do not configure these CLI adapters. Existing HTTP providers remain available and use their own connection fields.
+- **Single-configuration compatibility:** `llm: { ... }` is still accepted in place of a one-entry `llm_list`. Never define both `llm` and `llm_list` in the same YAML document.
+- **Tier overrides:** inside any entry, a tier can override `provider`, `model`, `cli_path`, `base_url`, `api_key_env`, `reasoning_style`, and `options` as supported by that provider. Connection fields not overridden inherit from the entry. In particular, switching from Pi to another CLI does **not** clear an inherited Pi executable path: explicitly override `cli_path` too. Options are provider-specific, not arbitrary command-line flags.
+
+For example, replace `strong` inside the Pi entry above to use Codex for that tier while keeping the other tiers on Pi:
+
+```yaml
+      strong:
+        provider: codex
+        cli_path: codex
+        model: "YOUR_CODEX_MODEL"
+        options:
+          reasoning_effort: high
+```
+
+Other top-level sections include `segment`, `pipeline`, `honorific`, `punctuation`, `paths`, and `output`. See [configuration reference](docs/configuration.md) and the checked-in [configuration example](config.yaml). The default configuration path is `config.yaml` in the current working directory. A missing configuration file is automatically created from the built-in template; **that template is not a ready-authenticated Pi setup**—review it before continuing. Do not commit local credentials or private configuration.
+
+### Command syntax: Wenyi vs. the underlying agent
+
+Use this structure (angle brackets describe placeholders; do not type them):
+
+```text
+uv run trans-novel [--config <config-file> | -c <config-file>] <command> [arguments] [options]
+```
+
+**Global `--config/-c` goes before the subcommand.** Model selection belongs in YAML, not in a made-up `translate --model` argument. Quote file paths containing spaces.
 
 ```bash
-export DEEPSEEK_API_KEY=sk-...
+uv run trans-novel -c config.local.yaml prepare "books/my book.epub"
+uv run trans-novel -c config.local.yaml translate "books/my book.epub" --bilingual
+uv run trans-novel -c config.local.yaml review "books/my book.epub"
+uv run trans-novel -c config.local.yaml status "books/my book.epub"
+uv run trans-novel translate --help
 ```
+
+Use the same `-c` selection on later stages and resumed runs. Examples elsewhere in this README that omit `-c` use the default `config.yaml`.
+
+Wenyi constructs the agent commands itself. These are **invocation shapes**, not configuration values or complete standalone translation commands; prompts and protocol input are supplied by the adapters:
+
+| Wenyi `provider` | Installed agent | Invocation shape |
+|---|---|---|
+| `pi` | Pi CLI | `pi -p --mode json --model MODEL --thinking LEVEL ...` |
+| `codex` | Codex CLI | `codex exec --json --model MODEL ... -` |
+| `anthropic` | Claude Code CLI | `claude -p --output-format json --model MODEL ...` |
+| `codebuddy` | CodeBuddy Code CLI | `codebuddy -p --output-format json --model MODEL ...` |
+| `agy` | Agy CLI | `agy --print= --input-format stream-json --output-format stream-json --disable-slash-commands --model MODEL --effort LEVEL` |
+
+For Pi, the adapter's command is equivalent to the following shape:
+
+```text
+pi -p --no-tools --no-session --no-extensions --no-context-files --no-skills --no-prompt-templates --mode json --model MODEL --thinking LEVEL [--system-prompt TEMP_FILE]
+```
+
+Wenyi sends the user text on stdin, uses a temporary file for a nonempty system prompt, and reads the final assistant text and usage from JSONL events. It deliberately disables Pi tools, extensions, skills, prompt templates, context-file discovery, and persistent sessions: **the CLI supplies model responses; Wenyi owns translation orchestration and saved state**. Agy instead receives structured stream-JSON input, so a plain-text pipe is not interchangeable with its protocol.
 
 ### One-command translation
 

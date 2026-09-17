@@ -2,9 +2,9 @@
 
 # 📚 文译
 
-**一条命令，从 EPUB 到可读的中文译本。**
+**直接调用本地 CLI Agent，尤其是 Pi CLI，完成整本书的翻译工作流。**
 
-全书预扫 · 实时术语闭环 · 多阶段审校
+直接调用 CLI · 全书预扫 · 实时术语闭环 · 多阶段审校
 
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square)](https://www.python.org/)
 [![Tests](https://img.shields.io/github/actions/workflow/status/BigDawnGhost/wenyi/tests.yml?style=flat-square)](https://github.com/BigDawnGhost/wenyi/actions/workflows/tests.yml)
@@ -25,6 +25,8 @@
 - [为什么选择文译](#为什么选择文译)
 - [核心特性](#核心特性)
 - [快速开始](#快速开始)
+  - [本项目专用配置格式](#本项目专用配置格式yaml不是-agent-原生配置)
+  - [命令格式](#命令格式区分-wenyi-命令和底层-agent-命令)
 - [支持格式](#支持格式)
 - [翻译流水线](#翻译流水线)
 - [文档](#文档)
@@ -44,7 +46,9 @@
 | 一次性翻译，中断即作废 | 批次检查点 + 章节状态记录，任意中断后重新执行同一命令即可续跑 |
 | 模型直出，无系统性质控 | 翻译 → 润色 → 取证式全书审校 |
 
-文译为**长文本**设计 —— 长篇小说、社科专著、纪实文学……
+文译为**长文本**设计 —— 长篇小说、社科专著、纪实文学……主打**直接调用本机安装的各种 CLI Agent，尤其是 Pi CLI**，而不是要求每个模型都单独配置一套 HTTP API 接入。Wenyi 负责解析、上下文、术语、翻译、审校和导出，所选 Agent 负责模型访问与鉴权；已有 HTTP provider 仍作为可选接入方式保留。
+
+**仅支持拉取本仓库后本地运行，使用前必须安装并登录配置所对应的 CLI Agent。**
 
 ---
 
@@ -54,7 +58,8 @@
 - **实时术语闭环** — 翻译中自动提取人名、地名、术语和固定表达；检测译法冲突并提示人工裁决
 - **多阶段质量保证** — 可选润色（强档模型重译）和取证式全书 AI 审校
 - **断点续跑** — 批次级检查点、章节状态记录和原子状态写入；任意中断后重新执行同一命令即可续跑
-- **多种 LLM 支持** — DeepSeek、OpenAI、OpenRouter、OrcaRouter、Google Gemini、Ollama、vLLM，以及通用 OpenAI 兼容端点
+- **CLI Agent 优先接入** — Pi CLI（推荐）、Codex、Claude Code（`provider: anthropic`）、CodeBuddy Code、Agy；同时保留已有 HTTP provider
+- **本项目专用 YAML 路由** — `llm_list` + `llm_priority`、三档流程角色与按档位覆盖 provider
 - **原生 EPUB 回填** — 基于原书 XHTML 模板替换译文片段，尽量保留原书样式、图片、目录和锚点
 - **双语对照输出** — 可选原文译文对照版，原文视觉淡化，支持深色模式
 
@@ -62,25 +67,133 @@
 
 ## 快速开始
 
-### 环境要求
+### 环境要求：先安装并登录对应的 CLI Agent
 
-需要 Python 3.10+ 与 [uv](https://docs.astral.sh/uv/)。
+**本项目只支持拉取仓库源码后，在本机运行。** 独立可执行文件、托管网页服务或仅安装发布包，都不是本项目支持的部署方式。Wenyi 不会替你安装 CLI Agent，也不会代为完成登录。
 
-### 安装
+请先安装 Git、Python 3.10+、[uv](https://docs.astral.sh/uv/)，以及**配置中实际使用的全部 CLI Agent**，包括备用配置与档位覆盖所用的 Agent。**推荐优先使用 Pi CLI**；项目也集成了 Codex、Claude Code、CodeBuddy Code 和 Agy。各 Agent 的安装、登录及模型接入请按其自身文档完成，并确保所选模型在当前机器上可用。
+
+以 Pi 为例，在后续运行 Wenyi 的同一个终端、同一个用户账号下检查：
+
+```bash
+pi --version
+pi --help
+```
+
+然后完成 Pi 自身的登录、provider 与模型配置，并用所选模型直接执行一次简单提示词，确认可以得到回复。`--version` 成功只代表程序可运行，不代表登录和模型访问已成功。本地运行不等于离线推理：CLI 仍可能请求其配置的远程模型服务，并消耗额度。
+
+### 从仓库安装
 
 ```bash
 git clone https://github.com/BigDawnGhost/wenyi.git
 cd wenyi
-uv sync
+uv sync --locked
+uv run trans-novel --help
 ```
 
-### 配置
+下文命令均在仓库根目录执行。可执行文件不在 `PATH` 中时，用 `cli_path` 指定本机真实路径。Windows YAML 示例路径为 `'C:\Program Files\nodejs\pi.cmd'`，请按实际安装位置修改，不要照抄仓库配置中其他用户的路径。PowerShell 调用带空格的可执行文件路径时使用 `&`，例如 `& 'C:\Program Files\nodejs\pi.cmd' --version`。
 
-设置 API 密钥：
+### 本项目专用配置格式：YAML，不是 Agent 原生配置
+
+`config.yaml` 使用的是 **Wenyi 自己的配置结构**，负责流程开关、provider 路由、模型与档位。它不是 Pi 原生模型/鉴权文件，不是 Codex 的 TOML，也不是一条 Shell 命令。请先在对应 CLI Agent 中完成凭据与自定义模型注册。
+
+仓库中的 `config.yaml` 含有特定机器的路径和模型别名，不能直接假定在你本机可用。可以按需修改它，或将下面的最小示例保存为 `config.local.yaml` 并显式指定。所有 `YOUR_PROVIDER/YOUR_MODEL` 都必须替换成你安装的 Pi CLI 能识别、能访问的模型标识：
+
+```yaml
+language:
+  source: auto
+  target: zh
+
+llm_priority: "0"
+llm_list:
+  - provider: pi
+    cli_path: pi  # 从 PATH 调用；也可以填写真实的绝对路径
+    timeout: 600
+    max_retries: 4
+    tiers:
+      strong:
+        model: "YOUR_PROVIDER/YOUR_MODEL"
+        options:
+          thinking: true
+          reasoning_effort: high
+      cheap:
+        model: "YOUR_PROVIDER/YOUR_MODEL"
+        options:
+          thinking: true
+          reasoning_effort: medium
+      fast:
+        model: "YOUR_PROVIDER/YOUR_MODEL"
+        options:
+          thinking: false
+
+pipeline:
+  polish: true
+  review: false
+
+output:
+  mono: true
+  bilingual: false
+```
+
+- **`llm_list`**：1–10 项完整的 provider 配置，按列表位置从 **0** 编号。每项独立设置 `provider`、`cli_path`、`timeout`（秒）、`max_retries` 与 `tiers`。
+- **`llm_priority`**：必须是带引号的字符串，且每个配置索引恰好出现一次。三项配置时，`"021"` 表示先用第 0 项，再到第 2 项、最后第 1 项；不是模型权重，也不是档位名。单项写 `"0"`，省略则按列表顺序生成。重复、遗漏或越界索引均不合法。
+- **不是通用故障切换**：当前多配置调度器针对 `PiAuditError` 自动切换，并非所有超时、登录错误或 provider 失败都会切换。距上次记录的审计事件满 600 秒后，后续请求可以恢复首选配置。启动前应确保全部配置使用的 Agent 已安装且可用，不能依靠备用项来代替环境配置。
+- **`tiers.strong / cheap / fast`**：是 Wenyi 的流程角色，不是 CLI 子命令，也不保证真实价格高低。`strong` 用于分析、正文翻译和润色；`cheap` 用于初审、注释对齐；`fast` 用于章节梗概、全书概要。Review Agent/Fixer 还受 `pipeline.review_agent_tier` 控制。建议显式填写三档，即使全部使用同一个模型。
+- **Pi 选项映射**：`model` 原样传给 `pi --model`，可以是 Pi 能识别的模型 ID 或 `provider/model` 选择器。Wenyi 的 `provider: pi` 选中的是 CLI 适配器，不是底层模型厂商。`thinking: true` 将 `reasoning_effort` 传给 `--thinking`；`thinking: false` 则发送 `--thinking off`。思考档位必须由你本机的 Pi 版本与模型支持。
+- **`cli_path` 只填可执行文件路径**，不要填 `pi -p --model ...` 整条命令。省略时从 `PATH` 查找。Pi、Codex、Claude Code、CodeBuddy、Agy 的鉴权由对应 CLI 自身负责，Wenyi 的 `base_url` / `api_key_env` 不用于配置这些 CLI 适配器。原有 HTTP provider 仍可使用，并按各自规则读取连接字段。
+- **单配置兼容写法**：仍支持用 `llm: { ... }` 代替仅含一项的 `llm_list`，但同一份 YAML 不能同时定义 `llm` 和 `llm_list`。
+- **按档位覆盖**：每项配置内部的 tier 可以按 provider 支持情况覆盖 `provider`、`model`、`cli_path`、`base_url`、`api_key_env`、`reasoning_style` 与 `options`。未覆盖的连接字段继承该列表项。尤其注意：从 Pi 切换为其他 CLI **不会自动清除继承的 Pi 路径**，必须同时显式覆盖 `cli_path`。`options` 是 provider 专属选项，不是任意命令行参数透传。
+
+例如，在上面的 Pi 配置项中替换 `strong`，让该档使用 Codex，其余档仍使用 Pi：
+
+```yaml
+      strong:
+        provider: codex
+        cli_path: codex
+        model: "YOUR_CODEX_MODEL"
+        options:
+          reasoning_effort: high
+```
+
+其他顶层配置块包括 `segment`、`pipeline`、`honorific`、`punctuation`、`paths`、`output`，详见[配置说明](configuration.md)与[仓库配置示例](../../config.yaml)。默认读取当前工作目录的 `config.yaml`。配置文件不存在时会自动创建内置模板，但**自动生成不等于已经配好 Pi 或完成登录**，请先检查内容。不要提交本地凭据或私有配置。
+
+### 命令格式：区分 Wenyi 命令和底层 Agent 命令
+
+统一结构如下（尖括号表示占位说明，不要原样输入）：
+
+```text
+uv run trans-novel [--config <配置文件> | -c <配置文件>] <子命令> [位置参数] [选项]
+```
+
+**全局参数 `--config/-c` 放在子命令前。** 模型在 YAML 中选择，不要编造 `translate --model` 参数。带空格的文件路径必须加引号。
 
 ```bash
-export DEEPSEEK_API_KEY=sk-...
+uv run trans-novel -c config.local.yaml prepare "books/my book.epub"
+uv run trans-novel -c config.local.yaml translate "books/my book.epub" --bilingual
+uv run trans-novel -c config.local.yaml review "books/my book.epub"
+uv run trans-novel -c config.local.yaml status "books/my book.epub"
+uv run trans-novel translate --help
 ```
+
+后续阶段和断点续跑应使用同一份 `-c` 配置。本文其他省略 `-c` 的示例均使用默认 `config.yaml`。
+
+Wenyi 会自行组装底层 Agent 命令。下表是**调用形态**，不是配置字段，也不是可独立完成翻译的完整命令；提示词及协议输入由适配器提供：
+
+| Wenyi `provider` | 本机需要安装的 Agent | 调用形态 |
+|---|---|---|
+| `pi` | Pi CLI | `pi -p --mode json --model MODEL --thinking LEVEL ...` |
+| `codex` | Codex CLI | `codex exec --json --model MODEL ... -` |
+| `anthropic` | Claude Code CLI | `claude -p --output-format json --model MODEL ...` |
+| `codebuddy` | CodeBuddy Code CLI | `codebuddy -p --output-format json --model MODEL ...` |
+| `agy` | Agy CLI | `agy --print= --input-format stream-json --output-format stream-json --disable-slash-commands --model MODEL --effort LEVEL` |
+
+Pi 适配器实际组装的命令形态如下：
+
+```text
+pi -p --no-tools --no-session --no-extensions --no-context-files --no-skills --no-prompt-templates --mode json --model MODEL --thinking LEVEL [--system-prompt TEMP_FILE]
+```
+
+Wenyi 从 stdin 传入用户文本，有系统提示词时通过临时文件传入，再从 JSONL 事件流提取最终回复与用量。它会关闭 Pi 的工具、扩展、技能、提示词模板、上下文文件发现和会话持久化：**CLI 负责返回模型结果，Wenyi 负责编排翻译并保存运行状态**。Agy 则使用结构化 stream-JSON 输入，不能把普通文本管道当作同一协议直接替换。
 
 ### 一键翻译
 
