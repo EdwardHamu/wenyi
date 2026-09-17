@@ -1,7 +1,8 @@
 [project]
 name = "trans-novel"
-version = "0.2.0"
-description = "多 Agent 协同长篇小说翻译系统（多语言到中文），维护专有名词对照表以保证一致性、减少漏译。"
+dynamic = ["version"]
+description = "A multi-agent long-form novel translation system with context, terminology, polishing, and review."
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "openai>=1.40",        # DeepSeek（OpenAI 兼容）调用
@@ -10,18 +11,55 @@ dependencies = [
     "pyyaml>=6.0",         # 读取 config.yaml
     "tenacity>=8.2",       # LLM 调用重试/退避
     "beautifulsoup4>=4.12", # EPUB 正文块提取
+    "httpx>=0.27",         # PDF 转换服务 HTTP 客户端
     "lxml>=5.0",           # bs4 的 XHTML 解析后端
     "ebooklib>=0.18",      # EPUB 读写
     "typer>=0.12",         # CLI
     "rich>=13.7",          # 表格 / 进度条
+    "json-repair>=0.61,<1", # 仅用于 Reviewer 畸形 JSON 的本地修复
+    "pypdf>=6.14.2",
+    "google-genai>=2.13.0",
+    "python-docx>=1.2.0",
+    "tiktoken>=0.14.0",
 ]
+
+[project.optional-dependencies]
+pdf-output = [
+    "weasyprint>=69.0",
+]
+pdf-output-lite = [
+    "fpdf2>=2.8.5",
+]
+
+[dependency-groups]
+dev = [
+    "pre-commit>=3.7",
+    "pytest>=8.0",
+    "ruff>=0.12",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+# E/W pycodestyle, F pyflakes, I import 排序
+select = ["E", "W", "F", "I"]
+# 超长行主要是中文 prompt 字面量，formatter 不会拆字符串
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [project.scripts]
 trans-novel = "trans_novel.cli:main"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["trans_novel"]

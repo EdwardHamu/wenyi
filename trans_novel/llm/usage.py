@@ -57,9 +57,7 @@ def make_usage_sample(
         return None
     prompt_tokens = read_usage_int(usage, "prompt_tokens")
     completion_tokens = read_usage_int(usage, "completion_tokens")
-    total_tokens = read_usage_int(usage, "total_tokens") or (
-        prompt_tokens + completion_tokens
-    )
+    total_tokens = read_usage_int(usage, "total_tokens") or (prompt_tokens + completion_tokens)
     return UsageSample(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
@@ -70,6 +68,7 @@ def make_usage_sample(
 
 
 def _hit_rate(hit: int, miss: int) -> float:
+    """计算缓存 token 命中率，无可统计 token 时返回 0。"""
     total = hit + miss
     return round(hit / total, 4) if total else 0.0
 
@@ -83,32 +82,36 @@ def _normalize_usage_group(
         for name, values in group.items()
     }
     for slot in normalized.values():
-        slot["cache_hit_rate"] = _hit_rate(
-            slot["cache_hit_tokens"], slot["cache_miss_tokens"]
-        )
+        slot["cache_hit_rate"] = _hit_rate(slot["cache_hit_tokens"], slot["cache_miss_tokens"])
     return normalized
 
 
 def _usage_summary(
     by_tier: dict[str, dict[str, int]],
     by_stage: dict[str, dict[str, int]],
+    by_provider: dict[str, dict[str, int]] | None = None,
 ) -> dict[str, Any]:
-    """生成规范汇总；总计仅由 tier 计算，stage 是同一用量的另一种归因维度。"""
+    """生成规范汇总；总计仅由 tier 计算，stage 与 provider 是同一用量的另外两种归因维度。"""
     tiers = _normalize_usage_group(by_tier)
     stages = _normalize_usage_group(by_stage)
+    providers = _normalize_usage_group(by_provider or {})
     totals: dict[str, Any] = dict.fromkeys(_USAGE_FIELDS, 0)
     for values in tiers.values():
         for field in _USAGE_FIELDS:
             totals[field] += values[field]
-    totals["cache_hit_rate"] = _hit_rate(
-        totals["cache_hit_tokens"], totals["cache_miss_tokens"]
-    )
-    return {"totals": totals, "by_tier": tiers, "by_stage": stages}
+    totals["cache_hit_rate"] = _hit_rate(totals["cache_hit_tokens"], totals["cache_miss_tokens"])
+    return {
+        "totals": totals,
+        "by_tier": tiers,
+        "by_stage": stages,
+        "by_provider": providers,
+    }
 
 
 def _usage_group_delta(
     current: dict[str, dict[str, int]], previous: dict[str, dict[str, int]]
 ) -> dict[str, dict[str, int]]:
+    """按槽位计算累计用量的非负字段增量，并移除全零槽位。"""
     delta: dict[str, dict[str, int]] = {}
     for name, values in current.items():
         old = previous.get(name) or {}
@@ -127,6 +130,7 @@ def _usage_group_delta(
 def _merge_usage_groups(
     *groups: dict[str, dict[str, int]],
 ) -> dict[str, dict[str, int]]:
+    """按槽位逐字段累加多组 token 用量。"""
     merged: dict[str, dict[str, int]] = {}
     for group in groups:
         for name, values in group.items():
@@ -138,44 +142,77 @@ def _merge_usage_groups(
 
 def usage_delta(current: dict[str, Any], previous: dict[str, Any]) -> dict[str, Any]:
     """计算两个累计快照之间的非负增量，用于避免重复落盘。"""
-    tier_delta = _usage_group_delta(current["by_tier"], previous["by_tier"])
-    stage_delta = _usage_group_delta(current["by_stage"], previous["by_stage"])
-    return _usage_summary(tier_delta, stage_delta)
+    tier_delta = _usage_group_delta(current.get("by_tier") or {}, previous.get("by_tier") or {})
+    stage_delta = _usage_group_delta(current.get("by_stage") or {}, previous.get("by_stage") or {})
+    provider_delta = _usage_group_delta(
+        current.get("by_provider") or {}, previous.get("by_provider") or {}
+    )
+    return _usage_summary(tier_delta, stage_delta, provider_delta)
 
 
-def merge_usage_summaries(
-    accumulated: dict[str, Any], increment: dict[str, Any]
-) -> dict[str, Any]:
+def merge_usage_summaries(accumulated: dict[str, Any], increment: dict[str, Any]) -> dict[str, Any]:
     """把一次运行增量合并进某本书的历史累计用量。"""
-    tiers = _merge_usage_groups(accumulated["by_tier"], increment["by_tier"])
-    stages = _merge_usage_groups(accumulated["by_stage"], increment["by_stage"])
-    return _usage_summary(tiers, stages)
+    tiers = _merge_usage_groups(accumulated.get("by_tier") or {}, increment.get("by_tier") or {})
+    stages = _merge_usage_groups(accumulated.get("by_stage") or {}, increment.get("by_stage") or {})
+    providers = _merge_usage_groups(
+        accumulated.get("by_provider") or {}, increment.get("by_provider") or {}
+    )
+    return _usage_summary(tiers, stages, providers)
 
 
-class UsageTracker:
-    """线程安全地累加标准化用量，按 tier 和调用 stage 分别归因。"""
+class _BoundUsageTracker:
+    """代理到主 UsageTracker 的子客户端用量记录器，自动补充 provider。"""
 
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._by_tier: dict[str, dict[str, int]] = {}
-        self._by_stage: dict[str, dict[str, int]] = {}
+    def __init__(self, tracker: UsageTracker, provider: str) -> None:
+        self._tracker = tracker
+        self._provider = provider
 
     def record(
         self,
         tier: str,
         sample: UsageSample | None,
         stage: str | None = None,
+        provider: str | None = None,
+    ) -> None:
+        self._tracker.record(tier, sample, stage=stage, provider=provider or self._provider)
+
+    def summary(self) -> dict[str, Any]:
+        return self._tracker.summary()
+
+
+class UsageTracker:
+    """线程安全地累加标准化用量，按 tier、调用 stage 和 provider 分别归因。"""
+
+    def __init__(self, *, default_provider: str | None = None) -> None:
+        """初始化 tier、调用阶段与 provider 归因视图；总计始终以 tier 为准。"""
+        self._lock = threading.Lock()
+        self._default_provider = default_provider
+        self._by_tier: dict[str, dict[str, int]] = {}
+        self._by_stage: dict[str, dict[str, int]] = {}
+        self._by_provider: dict[str, dict[str, int]] = {}
+
+    def bind(self, provider: str) -> _BoundUsageTracker:
+        """返回绑定了特定 provider 的用量跟踪代理。"""
+        return _BoundUsageTracker(self, provider)
+
+    def record(
+        self,
+        tier: str,
+        sample: UsageSample | None,
+        stage: str | None = None,
+        provider: str | None = None,
     ) -> None:
         """累加 provider 标准化后的用量；缺失时静默跳过。"""
         if sample is None:
             return
+        target_provider = provider or self._default_provider
         with self._lock:
-            slots = [
-                self._by_tier.setdefault(tier, dict.fromkeys(_USAGE_FIELDS, 0))
-            ]
+            slots = [self._by_tier.setdefault(tier, dict.fromkeys(_USAGE_FIELDS, 0))]
             if stage:
+                slots.append(self._by_stage.setdefault(stage, dict.fromkeys(_USAGE_FIELDS, 0)))
+            if target_provider:
                 slots.append(
-                    self._by_stage.setdefault(stage, dict.fromkeys(_USAGE_FIELDS, 0))
+                    self._by_provider.setdefault(target_provider, dict.fromkeys(_USAGE_FIELDS, 0))
                 )
             for slot in slots:
                 slot["calls"] += 1
@@ -186,10 +223,9 @@ class UsageTracker:
                 slot["cache_miss_tokens"] += sample.cache_miss_tokens
 
     def summary(self) -> dict[str, Any]:
-        """返回 totals、by_tier 和 by_stage，各槽位含 cache_hit_rate。"""
+        """返回 totals、by_tier、by_stage 和 by_provider，各槽位含 cache_hit_rate。"""
         with self._lock:
             by_tier = {tier: dict(values) for tier, values in self._by_tier.items()}
-            by_stage = {
-                stage: dict(values) for stage, values in self._by_stage.items()
-            }
-        return _usage_summary(by_tier, by_stage)
+            by_stage = {stage: dict(values) for stage, values in self._by_stage.items()}
+            by_provider = {provider: dict(values) for provider, values in self._by_provider.items()}
+        return _usage_summary(by_tier, by_stage, by_provider)

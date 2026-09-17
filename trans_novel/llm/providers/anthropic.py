@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess
 import tempfile
 import threading
 from typing import Any, Optional
@@ -28,6 +27,7 @@ from ...config import LLMConfig
 from ..base import LLMClient, Messages
 from ..tiers import resolve_tier
 from ..usage import UsageSample, read_usage_int
+from ._cli import run_cli_process
 from ._openai_compatible import ResolvedTier, resolve_provider_tiers
 
 _JSON_MODE_INSTRUCTION = "Output must be valid json."
@@ -130,13 +130,9 @@ def build_cli_invocation(
     system_text, chat_messages = _split_system(messages)
     if json_mode:
         system_text = (
-            f"{system_text}\n\n{_JSON_MODE_INSTRUCTION}"
-            if system_text
-            else _JSON_MODE_INSTRUCTION
+            f"{system_text}\n\n{_JSON_MODE_INSTRUCTION}" if system_text else _JSON_MODE_INSTRUCTION
         )
-    stdin_text = "\n\n".join(
-        str(message.get("content", "")) for message in chat_messages
-    )
+    stdin_text = "\n\n".join(str(message.get("content", "")) for message in chat_messages)
     extra_argv: list[str] = ["--model", tier_config.model]
     if tier_config.options.thinking:
         extra_argv += ["--effort", tier_config.options.reasoning_effort]
@@ -152,23 +148,21 @@ class AnthropicClient(LLMClient):
     不需要配置 API key / base_url。
     """
 
-    def __init__(self, cfg: LLMConfig):
+    def __init__(self, cfg: LLMConfig, *, require_strong: bool = True):
         super().__init__()
+        self.provider_name = "Anthropic"
         self.cfg = cfg
         if cfg.base_url:
-            print(
-                "提示：anthropic provider 已改用本机 claude CLI，"
-                "llm.base_url 不再生效，已忽略。"
-            )
+            print("提示：anthropic provider 已改用本机 claude CLI，llm.base_url 不再生效，已忽略。")
         if cfg.api_key_env:
             print(
-                "提示：anthropic provider 已改用本机 claude CLI，"
-                "llm.api_key_env 不再生效，已忽略。"
+                "提示：anthropic provider 已改用本机 claude CLI，llm.api_key_env 不再生效，已忽略。"
             )
         self.tiers = resolve_provider_tiers(
             cfg.tiers,
             options_type=AnthropicTierOptions,
             defaults=_default_tiers(),
+            require_strong=require_strong,
         )
         for name, tier in self.tiers.items():
             if tier.options.extra_body:
@@ -179,8 +173,12 @@ class AnthropicClient(LLMClient):
         self._cli_path: str | None = None
         self._cli_path_lock = threading.Lock()
 
-    def _ensure_cli_path(self) -> str:
+    def _ensure_cli_path(
+        self, tier_config: ResolvedTier[AnthropicTierOptions] | None = None
+    ) -> str:
         with self._cli_path_lock:
+            if tier_config and tier_config.cli_path:
+                return tier_config.cli_path
             if self._cli_path is None:
                 path = self.cfg.cli_path or shutil.which("claude")
                 if not path:
@@ -205,7 +203,7 @@ class AnthropicClient(LLMClient):
         extra_argv, system_prompt, stdin_text = build_cli_invocation(
             tier_config, messages, json_mode=json_mode
         )
-        cli_path = self._ensure_cli_path()
+        cli_path = self._ensure_cli_path(tier_config)
         argv = (
             [cli_path]
             + [
@@ -234,6 +232,8 @@ class AnthropicClient(LLMClient):
         argv += ["-p"]
 
         try:
+            request_id = self._new_request_id()
+            attempt = 0
 
             @retry(
                 stop=stop_after_attempt(self.cfg.max_retries + 1),
@@ -242,29 +242,32 @@ class AnthropicClient(LLMClient):
                 reraise=True,
             )
             def _call() -> str:
-                proc = subprocess.run(
-                    argv,
-                    input=stdin_text,
-                    capture_output=True,
-                    text=True,
-                    timeout=self.cfg.timeout,
-                    encoding="utf-8",
-                )
-                if proc.returncode != 0:
-                    raise RuntimeError(
-                        f"claude CLI 退出码非 0（{proc.returncode}）：{proc.stderr[:500]}"
+                nonlocal attempt
+                attempt += 1
+                with self.request_status(
+                    tier=tier, stage=stage, request_id=request_id, attempt=attempt
+                ):
+                    proc = run_cli_process(
+                        argv,
+                        input_text=stdin_text,
+                        timeout=self.cfg.timeout,
+                        provider="Claude",
                     )
-                try:
-                    data = json.loads(proc.stdout)
-                except ValueError as error:
-                    raise RuntimeError(
-                        f"claude CLI 输出不是合法 JSON：{proc.stdout[:500]!r}"
-                    ) from error
-                if data.get("is_error"):
-                    raise RuntimeError(f"claude CLI 返回错误：{data!r}")
-                sample = normalize_anthropic_usage(data.get("usage"))
-                self.usage.record(tier, sample, stage)
-                return data.get("result", "")
+                    if proc.returncode != 0:
+                        raise RuntimeError(
+                            f"claude CLI 退出码非 0（{proc.returncode}）：{proc.stderr[:500]}"
+                        )
+                    try:
+                        data = json.loads(proc.stdout)
+                    except ValueError as error:
+                        raise RuntimeError(
+                            f"claude CLI 输出不是合法 JSON：{proc.stdout[:500]!r}"
+                        ) from error
+                    if data.get("is_error"):
+                        raise RuntimeError(f"claude CLI 返回错误：{data!r}")
+                    sample = normalize_anthropic_usage(data.get("usage"))
+                    self.usage.record(tier, sample, stage, provider=self.provider_name)
+                    return data.get("result", "")
 
             return _call()
         finally:

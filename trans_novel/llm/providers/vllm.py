@@ -7,10 +7,12 @@ DEFAULT_BASE_URL = "http://localhost:8000/v1"
 
 
 class VLLMClient(OpenAICompatibleClient):
-    def __init__(self, cfg: LLMConfig):
+    def __init__(self, cfg: LLMConfig, *, require_strong: bool = True):
+        """使用 vLLM 本地默认地址初始化默认免密的兼容客户端。"""
         super().__init__(
             cfg,
             provider_name="vLLM",
             default_base_url=DEFAULT_BASE_URL,
             requires_api_key=False,
+            require_strong=require_strong,
         )

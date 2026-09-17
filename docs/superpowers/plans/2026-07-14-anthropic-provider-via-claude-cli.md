@@ -183,96 +183,101 @@ In `tests/test_llm.py`, the existing `TestAnthropicProvider` class (currently li
 Replace ALL SIX of those tests (keep `test_usage_normalization_treats_cache_write_as_miss` and `test_usage_normalization_handles_missing_usage` at lines 438-459 untouched) with:
 
 ```python
-    def test_splits_system_and_defaults_to_effort_flag(self):
-        from trans_novel.llm.providers._openai_compatible import ResolvedTier
-        from trans_novel.llm.providers.anthropic import (
-            AnthropicTierOptions,
-            build_cli_invocation,
-        )
+def test_splits_system_and_defaults_to_effort_flag(self):
+    from trans_novel.llm.providers._openai_compatible import ResolvedTier
+    from trans_novel.llm.providers.anthropic import (
+        AnthropicTierOptions,
+        build_cli_invocation,
+    )
 
-        tier = ResolvedTier(model="claude-opus-4-8", options=AnthropicTierOptions())
-        extra_argv, system_prompt, stdin_text = build_cli_invocation(tier, self.messages)
+    tier = ResolvedTier(model="claude-opus-4-8", options=AnthropicTierOptions())
+    extra_argv, system_prompt, stdin_text = build_cli_invocation(tier, self.messages)
 
-        self.assertEqual(system_prompt, "你是翻译。")
-        self.assertEqual(stdin_text, "x")
-        self.assertIn("--model", extra_argv)
-        self.assertEqual(extra_argv[extra_argv.index("--model") + 1], "claude-opus-4-8")
-        self.assertIn("--effort", extra_argv)
-        self.assertEqual(extra_argv[extra_argv.index("--effort") + 1], "high")
+    self.assertEqual(system_prompt, "你是翻译。")
+    self.assertEqual(stdin_text, "x")
+    self.assertIn("--model", extra_argv)
+    self.assertEqual(extra_argv[extra_argv.index("--model") + 1], "claude-opus-4-8")
+    self.assertIn("--effort", extra_argv)
+    self.assertEqual(extra_argv[extra_argv.index("--effort") + 1], "high")
 
-    def test_thinking_disabled_skips_effort_flag(self):
-        from trans_novel.llm.providers._openai_compatible import ResolvedTier
-        from trans_novel.llm.providers.anthropic import (
-            AnthropicTierOptions,
-            build_cli_invocation,
-        )
 
-        tier = ResolvedTier(
-            model="claude-haiku-4-5",
-            options=AnthropicTierOptions(thinking=False),
-        )
-        extra_argv, _, _ = build_cli_invocation(tier, self.messages)
+def test_thinking_disabled_skips_effort_flag(self):
+    from trans_novel.llm.providers._openai_compatible import ResolvedTier
+    from trans_novel.llm.providers.anthropic import (
+        AnthropicTierOptions,
+        build_cli_invocation,
+    )
 
-        self.assertNotIn("--effort", extra_argv)
+    tier = ResolvedTier(
+        model="claude-haiku-4-5",
+        options=AnthropicTierOptions(thinking=False),
+    )
+    extra_argv, _, _ = build_cli_invocation(tier, self.messages)
 
-    def test_custom_reasoning_effort_is_passed_through(self):
-        from trans_novel.llm.providers._openai_compatible import ResolvedTier
-        from trans_novel.llm.providers.anthropic import (
-            AnthropicTierOptions,
-            build_cli_invocation,
-        )
+    self.assertNotIn("--effort", extra_argv)
 
-        tier = ResolvedTier(
-            model="claude-opus-4-8",
-            options=AnthropicTierOptions(reasoning_effort="xhigh"),
-        )
-        extra_argv, _, _ = build_cli_invocation(tier, self.messages)
 
-        self.assertEqual(extra_argv[extra_argv.index("--effort") + 1], "xhigh")
+def test_custom_reasoning_effort_is_passed_through(self):
+    from trans_novel.llm.providers._openai_compatible import ResolvedTier
+    from trans_novel.llm.providers.anthropic import (
+        AnthropicTierOptions,
+        build_cli_invocation,
+    )
 
-    def test_json_mode_appends_instruction_without_mutating_input(self):
-        from trans_novel.llm.providers._openai_compatible import ResolvedTier
-        from trans_novel.llm.providers.anthropic import (
-            AnthropicTierOptions,
-            build_cli_invocation,
-        )
+    tier = ResolvedTier(
+        model="claude-opus-4-8",
+        options=AnthropicTierOptions(reasoning_effort="xhigh"),
+    )
+    extra_argv, _, _ = build_cli_invocation(tier, self.messages)
 
-        tier = ResolvedTier(model="m", options=AnthropicTierOptions(thinking=False))
-        _, system_prompt, _ = build_cli_invocation(tier, self.messages, json_mode=True)
+    self.assertEqual(extra_argv[extra_argv.index("--effort") + 1], "xhigh")
 
-        self.assertIn("json", system_prompt)
-        self.assertEqual(self.messages[0]["content"], "你是翻译。")
 
-    def test_json_mode_without_system_message_still_injects_instruction(self):
-        from trans_novel.llm.providers._openai_compatible import ResolvedTier
-        from trans_novel.llm.providers.anthropic import (
-            AnthropicTierOptions,
-            build_cli_invocation,
-        )
+def test_json_mode_appends_instruction_without_mutating_input(self):
+    from trans_novel.llm.providers._openai_compatible import ResolvedTier
+    from trans_novel.llm.providers.anthropic import (
+        AnthropicTierOptions,
+        build_cli_invocation,
+    )
 
-        tier = ResolvedTier(model="m", options=AnthropicTierOptions(thinking=False))
-        _, system_prompt, _ = build_cli_invocation(
-            tier, [{"role": "user", "content": "x"}], json_mode=True
-        )
+    tier = ResolvedTier(model="m", options=AnthropicTierOptions(thinking=False))
+    _, system_prompt, _ = build_cli_invocation(tier, self.messages, json_mode=True)
 
-        self.assertIn("json", system_prompt)
+    self.assertIn("json", system_prompt)
+    self.assertEqual(self.messages[0]["content"], "你是翻译。")
 
-    def test_multiple_non_system_messages_join_into_stdin_text(self):
-        from trans_novel.llm.providers._openai_compatible import ResolvedTier
-        from trans_novel.llm.providers.anthropic import (
-            AnthropicTierOptions,
-            build_cli_invocation,
-        )
 
-        tier = ResolvedTier(model="m", options=AnthropicTierOptions(thinking=False))
-        messages = [
-            {"role": "system", "content": "sys"},
-            {"role": "user", "content": "first"},
-            {"role": "assistant", "content": "second"},
-        ]
-        _, _, stdin_text = build_cli_invocation(tier, messages)
+def test_json_mode_without_system_message_still_injects_instruction(self):
+    from trans_novel.llm.providers._openai_compatible import ResolvedTier
+    from trans_novel.llm.providers.anthropic import (
+        AnthropicTierOptions,
+        build_cli_invocation,
+    )
 
-        self.assertEqual(stdin_text, "first\n\nsecond")
+    tier = ResolvedTier(model="m", options=AnthropicTierOptions(thinking=False))
+    _, system_prompt, _ = build_cli_invocation(
+        tier, [{"role": "user", "content": "x"}], json_mode=True
+    )
+
+    self.assertIn("json", system_prompt)
+
+
+def test_multiple_non_system_messages_join_into_stdin_text(self):
+    from trans_novel.llm.providers._openai_compatible import ResolvedTier
+    from trans_novel.llm.providers.anthropic import (
+        AnthropicTierOptions,
+        build_cli_invocation,
+    )
+
+    tier = ResolvedTier(model="m", options=AnthropicTierOptions(thinking=False))
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "second"},
+    ]
+    _, _, stdin_text = build_cli_invocation(tier, messages)
+
+    self.assertEqual(stdin_text, "first\n\nsecond")
 ```
 
 Also update the class docstring-adjacent `messages` fixture at the top of `TestAnthropicProvider` (lines 328-332) — it stays as-is:
@@ -396,13 +401,9 @@ def build_cli_invocation(
     system_text, chat_messages = _split_system(messages)
     if json_mode:
         system_text = (
-            f"{system_text}\n\n{_JSON_MODE_INSTRUCTION}"
-            if system_text
-            else _JSON_MODE_INSTRUCTION
+            f"{system_text}\n\n{_JSON_MODE_INSTRUCTION}" if system_text else _JSON_MODE_INSTRUCTION
         )
-    stdin_text = "\n\n".join(
-        str(message.get("content", "")) for message in chat_messages
-    )
+    stdin_text = "\n\n".join(str(message.get("content", "")) for message in chat_messages)
     extra_argv: list[str] = ["--model", tier_config.model]
     if tier_config.options.thinking:
         extra_argv += ["--effort", tier_config.options.reasoning_effort]
@@ -466,153 +467,154 @@ git commit -m "refactor: replace anthropic SDK request-kwargs builder with CLI i
 Add to `tests/test_llm.py`, right after the `test_usage_normalization_handles_missing_usage` test (currently the last test in `TestAnthropicProvider`, ending at line 459) and before `class TestProviderFactory` (currently line 461):
 
 ```python
-    def test_complete_invokes_cli_and_returns_result_text(self):
-        import json
-        from unittest.mock import patch
+def test_complete_invokes_cli_and_returns_result_text(self):
+    import json
+    from unittest.mock import patch
 
-        from trans_novel.config import LLMConfig
-        from trans_novel.llm.providers.anthropic import AnthropicClient
+    from trans_novel.config import LLMConfig
+    from trans_novel.llm.providers.anthropic import AnthropicClient
 
-        cfg = LLMConfig(tiers={"strong": {"model": "claude-opus-4-8"}})
-        client = AnthropicClient(cfg)
+    cfg = LLMConfig(tiers={"strong": {"model": "claude-opus-4-8"}})
+    client = AnthropicClient(cfg)
 
-        fake_result = {
-            "is_error": False,
-            "result": "你好",
-            "usage": {
-                "input_tokens": 10,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "output_tokens": 5,
-            },
-        }
+    fake_result = {
+        "is_error": False,
+        "result": "你好",
+        "usage": {
+            "input_tokens": 10,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "output_tokens": 5,
+        },
+    }
 
-        captured = {}
+    captured = {}
 
-        def fake_run(argv, *, input, capture_output, text, timeout, encoding):
-            captured["argv"] = argv
-            captured["input"] = input
-            captured["timeout"] = timeout
-            captured["encoding"] = encoding
+    def fake_run(argv, *, input, capture_output, text, timeout, encoding):
+        captured["argv"] = argv
+        captured["input"] = input
+        captured["timeout"] = timeout
+        captured["encoding"] = encoding
 
-            class Result:
-                returncode = 0
-                stdout = json.dumps(fake_result)
-                stderr = ""
+        class Result:
+            returncode = 0
+            stdout = json.dumps(fake_result)
+            stderr = ""
 
-            return Result()
+        return Result()
 
-        with patch("shutil.which", return_value=r"C:\nodejs\claude.cmd"), patch(
-            "subprocess.run", side_effect=fake_run
-        ):
-            text = client.complete(
-                [
-                    {"role": "system", "content": "你是翻译。"},
-                    {"role": "user", "content": "hello"},
-                ],
-                tier="strong",
-                stage="Translator",
-            )
-
-        self.assertEqual(text, "你好")
-        self.assertEqual(captured["encoding"], "utf-8")
-        self.assertEqual(captured["input"], "hello")
-        self.assertIn(r"C:\nodejs\claude.cmd", captured["argv"])
-        self.assertIn("--safe-mode", captured["argv"])
-        self.assertIn("--no-session-persistence", captured["argv"])
-        self.assertIn("--tools", captured["argv"])
-        self.assertIn("none", captured["argv"])
-        self.assertIn("--system-prompt", captured["argv"])
-        self.assertIn("你是翻译。", captured["argv"])
-        self.assertIn("--model", captured["argv"])
-        self.assertIn("claude-opus-4-8", captured["argv"])
-
-        summary = client.usage_summary()
-        self.assertEqual(summary["totals"]["prompt_tokens"], 10)
-        self.assertEqual(summary["totals"]["completion_tokens"], 5)
-
-    def test_complete_retries_on_is_error_then_succeeds(self):
-        import json
-        from unittest.mock import patch
-
-        from trans_novel.config import LLMConfig
-        from trans_novel.llm.providers.anthropic import AnthropicClient
-
-        cfg = LLMConfig(tiers={"strong": {"model": "m"}}, max_retries=2)
-        client = AnthropicClient(cfg)
-
-        calls = {"count": 0}
-
-        def fake_run(argv, *, input, capture_output, text, timeout, encoding):
-            calls["count"] += 1
-
-            class Result:
-                returncode = 0
-                stderr = ""
-
-            result = Result()
-            if calls["count"] == 1:
-                result.stdout = json.dumps({"is_error": True, "result": ""})
-            else:
-                result.stdout = json.dumps(
-                    {"is_error": False, "result": "ok", "usage": None}
-                )
-            return result
-
-        with patch("shutil.which", return_value="/usr/bin/claude"), patch(
-            "subprocess.run", side_effect=fake_run
-        ), patch("time.sleep", return_value=None):
-            text = client.complete([{"role": "user", "content": "x"}])
-
-        self.assertEqual(text, "ok")
-        self.assertEqual(calls["count"], 2)
-
-    def test_complete_raises_when_cli_not_found(self):
-        from unittest.mock import patch
-
-        from trans_novel.config import LLMConfig
-        from trans_novel.llm.providers.anthropic import AnthropicClient
-
-        cfg = LLMConfig(tiers={"strong": {"model": "m"}})
-        client = AnthropicClient(cfg)
-
-        with patch("shutil.which", return_value=None):
-            with self.assertRaisesRegex(RuntimeError, "cli_path"):
-                client.complete([{"role": "user", "content": "x"}])
-
-    def test_complete_uses_explicit_cli_path_over_which(self):
-        import json
-        from unittest.mock import patch
-
-        from trans_novel.config import LLMConfig
-        from trans_novel.llm.providers.anthropic import AnthropicClient
-
-        cfg = LLMConfig(
-            tiers={"strong": {"model": "m"}}, cli_path=r"D:\custom\claude.cmd"
+    with (
+        patch("shutil.which", return_value=r"C:\nodejs\claude.cmd"),
+        patch("subprocess.run", side_effect=fake_run),
+    ):
+        text = client.complete(
+            [
+                {"role": "system", "content": "你是翻译。"},
+                {"role": "user", "content": "hello"},
+            ],
+            tier="strong",
+            stage="Translator",
         )
-        client = AnthropicClient(cfg)
 
-        captured = {}
+    self.assertEqual(text, "你好")
+    self.assertEqual(captured["encoding"], "utf-8")
+    self.assertEqual(captured["input"], "hello")
+    self.assertIn(r"C:\nodejs\claude.cmd", captured["argv"])
+    self.assertIn("--safe-mode", captured["argv"])
+    self.assertIn("--no-session-persistence", captured["argv"])
+    self.assertIn("--tools", captured["argv"])
+    self.assertIn("none", captured["argv"])
+    self.assertIn("--system-prompt", captured["argv"])
+    self.assertIn("你是翻译。", captured["argv"])
+    self.assertIn("--model", captured["argv"])
+    self.assertIn("claude-opus-4-8", captured["argv"])
 
-        def fake_run(argv, *, input, capture_output, text, timeout, encoding):
-            captured["argv"] = argv
+    summary = client.usage_summary()
+    self.assertEqual(summary["totals"]["prompt_tokens"], 10)
+    self.assertEqual(summary["totals"]["completion_tokens"], 5)
 
-            class Result:
-                returncode = 0
-                stdout = json.dumps(
-                    {"is_error": False, "result": "ok", "usage": None}
-                )
-                stderr = ""
 
-            return Result()
+def test_complete_retries_on_is_error_then_succeeds(self):
+    import json
+    from unittest.mock import patch
 
-        with patch("shutil.which", return_value="/usr/bin/claude"), patch(
-            "subprocess.run", side_effect=fake_run
-        ):
+    from trans_novel.config import LLMConfig
+    from trans_novel.llm.providers.anthropic import AnthropicClient
+
+    cfg = LLMConfig(tiers={"strong": {"model": "m"}}, max_retries=2)
+    client = AnthropicClient(cfg)
+
+    calls = {"count": 0}
+
+    def fake_run(argv, *, input, capture_output, text, timeout, encoding):
+        calls["count"] += 1
+
+        class Result:
+            returncode = 0
+            stderr = ""
+
+        result = Result()
+        if calls["count"] == 1:
+            result.stdout = json.dumps({"is_error": True, "result": ""})
+        else:
+            result.stdout = json.dumps({"is_error": False, "result": "ok", "usage": None})
+        return result
+
+    with (
+        patch("shutil.which", return_value="/usr/bin/claude"),
+        patch("subprocess.run", side_effect=fake_run),
+        patch("time.sleep", return_value=None),
+    ):
+        text = client.complete([{"role": "user", "content": "x"}])
+
+    self.assertEqual(text, "ok")
+    self.assertEqual(calls["count"], 2)
+
+
+def test_complete_raises_when_cli_not_found(self):
+    from unittest.mock import patch
+
+    from trans_novel.config import LLMConfig
+    from trans_novel.llm.providers.anthropic import AnthropicClient
+
+    cfg = LLMConfig(tiers={"strong": {"model": "m"}})
+    client = AnthropicClient(cfg)
+
+    with patch("shutil.which", return_value=None):
+        with self.assertRaisesRegex(RuntimeError, "cli_path"):
             client.complete([{"role": "user", "content": "x"}])
 
-        self.assertIn(r"D:\custom\claude.cmd", captured["argv"])
-        self.assertNotIn("/usr/bin/claude", captured["argv"])
+
+def test_complete_uses_explicit_cli_path_over_which(self):
+    import json
+    from unittest.mock import patch
+
+    from trans_novel.config import LLMConfig
+    from trans_novel.llm.providers.anthropic import AnthropicClient
+
+    cfg = LLMConfig(tiers={"strong": {"model": "m"}}, cli_path=r"D:\custom\claude.cmd")
+    client = AnthropicClient(cfg)
+
+    captured = {}
+
+    def fake_run(argv, *, input, capture_output, text, timeout, encoding):
+        captured["argv"] = argv
+
+        class Result:
+            returncode = 0
+            stdout = json.dumps({"is_error": False, "result": "ok", "usage": None})
+            stderr = ""
+
+        return Result()
+
+    with (
+        patch("shutil.which", return_value="/usr/bin/claude"),
+        patch("subprocess.run", side_effect=fake_run),
+    ):
+        client.complete([{"role": "user", "content": "x"}])
+
+    self.assertIn(r"D:\custom\claude.cmd", captured["argv"])
+    self.assertNotIn("/usr/bin/claude", captured["argv"])
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -638,14 +640,10 @@ class AnthropicClient(LLMClient):
         super().__init__()
         self.cfg = cfg
         if cfg.base_url:
-            print(
-                "提示：anthropic provider 已改用本机 claude CLI，"
-                "llm.base_url 不再生效，已忽略。"
-            )
+            print("提示：anthropic provider 已改用本机 claude CLI，llm.base_url 不再生效，已忽略。")
         if cfg.api_key_env:
             print(
-                "提示：anthropic provider 已改用本机 claude CLI，"
-                "llm.api_key_env 不再生效，已忽略。"
+                "提示：anthropic provider 已改用本机 claude CLI，llm.api_key_env 不再生效，已忽略。"
             )
         self.tiers = resolve_provider_tiers(
             cfg.tiers,

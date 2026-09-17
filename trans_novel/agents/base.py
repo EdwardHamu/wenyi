@@ -7,34 +7,84 @@ orchestrator._apply_language 依赖每个 agent 都有 .src 属性——基类�
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from ..config import Config
-from ..llm.base import LLMClient
+from ..llm.base import LLMClient, Messages
 
 _RAISE = object()  # 哨兵：未提供 default 时异常照常抛出，由调用方自理
 
 
 class Agent:
     def __init__(self, client: LLMClient, config: Config):
+        """保存共享客户端和配置，并缓存当前源语言、目标语言。"""
         self.client = client
         self.config = config
         self.src = config.source_lang
         self.tgt = config.target_lang
 
-    def _ask_json(self, system: str, user: str, *, tier: str,
-                  key: str | None = None, default: Any = _RAISE,
-                  max_tokens: int | None = None) -> Any:
+    def _complete_json_turn(
+        self,
+        messages: Messages,
+        *,
+        tier: str,
+        max_tokens: int | None = None,
+    ) -> tuple[Any, str]:
+        """调用 client.complete_json 并返回 (parsed_json, raw_assistant_text)。"""
+        data = self.client.complete_json(
+            messages,
+            tier=tier,
+            max_tokens=max_tokens,
+            stage=type(self).__name__,
+        )
+        raw = getattr(self.client, "last_json_response", lambda: None)()
+        if not raw:
+            raw = json.dumps(data, ensure_ascii=False)
+        return data, raw
+
+    def _ask_json(
+        self,
+        system: str,
+        user: str,
+        *,
+        tier: str,
+        key: str | None = None,
+        default: Any = _RAISE,
+        max_tokens: int | None = None,
+    ) -> Any:
         """system/user → complete_json。
 
         异常时返回 default（未给 default 则照常抛出，如 Translator 交由重试逻辑处理）。
         key 给出时：结果为 dict 取 data[key]（缺失回退）；结果为非空 list 直接用；否则回退。
         """
+        return self._ask_json_messages(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            tier=tier,
+            key=key,
+            default=default,
+            max_tokens=max_tokens,
+        )
+
+    def _ask_json_messages(
+        self,
+        messages: Messages,
+        *,
+        tier: str,
+        key: str | None = None,
+        default: Any = _RAISE,
+        max_tokens: int | None = None,
+    ) -> Any:
+        """针对已组装的消息列表（如续写轮次）请求并解析 JSON。"""
         try:
-            data = self.client.complete_json(
-                [{"role": "system", "content": system},
-                 {"role": "user", "content": user}], tier=tier,
-                max_tokens=max_tokens, stage=type(self).__name__)
+            data, _raw = self._complete_json_turn(
+                messages,
+                tier=tier,
+                max_tokens=max_tokens,
+            )
         except Exception:
             if default is _RAISE:
                 raise
@@ -46,15 +96,30 @@ class Agent:
             return data.get(key, fb)
         return data if data else fb
 
-    def _ask_text(self, system: str, user: str, *, tier: str,
-                  default: str = "", max_tokens: int | None = None) -> str:
+    def _ask_text(
+        self,
+        system: str,
+        user: str,
+        *,
+        tier: str,
+        default: str = "",
+        max_tokens: int | None = None,
+    ) -> str:
         """complete 纯文本并 strip；异常返回 default。"""
         try:
-            return (self.client.complete(
-                [{"role": "system", "content": system},
-                 {"role": "user", "content": user}], tier=tier,
-                max_tokens=max_tokens, stage=type(self).__name__) or "").strip()
-        except Exception:
+            return (
+                self.client.complete(
+                    [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    tier=tier,
+                    max_tokens=max_tokens,
+                    stage=type(self).__name__,
+                )
+                or ""
+            ).strip()
+        except Exception:  # noqa: BLE001 - 文本型辅助调用按契约回退默认值
             return default
 
     @staticmethod

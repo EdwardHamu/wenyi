@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TypeVar
+from typing import Any, TypeVar
 
 TierConfigT = TypeVar("TierConfigT")
 
@@ -18,3 +18,13 @@ def resolve_tier(tiers: dict[str, TierConfigT], tier: str) -> TierConfigT:
         if fallback in tiers:
             return tiers[fallback]
     return tiers["strong"]
+
+
+def resolve_tier_name(tiers: dict[str, Any], tier: str) -> str:
+    """按回退链解析命中的 tier 名字。缺 strong 时返回 'strong'。"""
+    if tier in tiers:
+        return tier
+    for fallback in _TIER_FALLBACK.get(tier, ("strong",)):
+        if fallback in tiers:
+            return fallback
+    return "strong"

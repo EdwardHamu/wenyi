@@ -2,22 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 from abc import abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Generic, Optional, TypeVar
+from typing import Any, Generic, TypeVar
 
 from pydantic import BaseModel
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
 
-from ...config import LLMConfig, TierConfig
+from ...config import LLMConfig, ReasoningStyle, TierConfig
 from ..base import LLMClient, Messages
+from ..retrying import EmptyResponseError, RetryReporter, provider_retry
 from ..tiers import resolve_tier
 from ..usage import (
     UsageSample,
@@ -36,6 +33,11 @@ class ResolvedTier(Generic[OptionsT]):
 
     model: str
     options: OptionsT
+    provider: str | None = None
+    base_url: str | None = None
+    api_key_env: str | None = None
+    cli_path: str | None = None
+    reasoning_style: ReasoningStyle | None = None
 
 
 def resolve_provider_tiers(
@@ -43,6 +45,7 @@ def resolve_provider_tiers(
     *,
     options_type: type[OptionsT],
     defaults: dict[str, ResolvedTier[OptionsT]] | None = None,
+    require_strong: bool = True,
 ) -> dict[str, ResolvedTier[OptionsT]]:
     """合并通用档位覆盖，并交给 provider 专属 options 模型校验。"""
     tiers = dict(defaults or {})
@@ -56,8 +59,14 @@ def resolve_provider_tiers(
         tiers[name] = ResolvedTier(
             model=model,
             options=options_type.model_validate(option_values),
+            provider=override.provider or (current.provider if current else None),
+            base_url=override.base_url or (current.base_url if current else None),
+            api_key_env=override.api_key_env or (current.api_key_env if current else None),
+            cli_path=override.cli_path or (current.cli_path if current else None),
+            reasoning_style=override.reasoning_style
+            or (current.reasoning_style if current else None),
         )
-    if "strong" not in tiers:
+    if require_strong and "strong" not in tiers:
         raise ValueError("配置缺少 llm.tiers.strong.model")
     return tiers
 
@@ -68,20 +77,28 @@ def base_request_kwargs(
     *,
     json_mode: bool,
 ) -> dict[str, Any]:
+    """构造 Chat Completions 基础参数，并为 JSON 模式补充明确指令。"""
     request_messages = messages
     if json_mode:
         request_messages = [dict(message) for message in messages]
         for message in request_messages:
             if message.get("role") == "system":
-                message["content"] = (
-                    f'{message.get("content", "")}\n\n{_JSON_MODE_INSTRUCTION}'
-                )
+                message["content"] = f"{message.get('content', '')}\n\n{_JSON_MODE_INSTRUCTION}"
                 break
         else:
             request_messages.insert(
                 0,
                 {"role": "system", "content": _JSON_MODE_INSTRUCTION},
             )
+        # 有些中转/网关只校验 user 角色内容（例如转发到 Responses API 的
+        # text.format 校验只看 input 里的用户内容），只在 system 里提到
+        # "json" 未必够，所以也在最后一条 user 消息里补一份，双重保证。
+        for message in reversed(request_messages):
+            if message.get("role") == "user":
+                content = str(message.get("content", ""))
+                if "json" not in content.lower():
+                    message["content"] = f"{content}\n\n{_JSON_MODE_INSTRUCTION}"
+                break
     kwargs: dict[str, Any] = {
         "model": model,
         "messages": request_messages,
@@ -139,6 +156,7 @@ class OpenAICompatibleBaseClient(LLMClient, Generic[OptionsT]):
         tiers: dict[str, ResolvedTier[OptionsT]],
         requires_api_key: bool,
     ) -> None:
+        """解析连接信息并保存已校验档位，SDK 客户端稍后按需创建。"""
         super().__init__()
         self.cfg = cfg
         self.provider_name = provider_name
@@ -146,14 +164,36 @@ class OpenAICompatibleBaseClient(LLMClient, Generic[OptionsT]):
         self.api_key_env = cfg.api_key_env or default_api_key_env
         self.tiers = tiers
         self.requires_api_key = requires_api_key
-        if not self.base_url:
+        if not self.base_url and not any(t.base_url for t in tiers.values()):
             raise ValueError(f"{provider_name} provider 需要配置 llm.base_url")
         self._client: Any = None
+        self._clients: dict[tuple[str, str | None], Any] = {}
         self._client_lock = threading.Lock()
 
-    def _ensure_client(self) -> Any:
+    def _validate_api_key_env(self, api_key_env: str | None) -> None:
+        if not api_key_env:
+            if self.requires_api_key:
+                raise RuntimeError(f"{self.provider_name} provider 需要配置 llm.api_key_env")
+            return
+        api_key = os.environ.get(api_key_env, "").strip()
+        if (self.requires_api_key or api_key_env) and not api_key:
+            raise RuntimeError(f"未设置环境变量 {api_key_env}（{self.provider_name} API key）")
+
+    def _ensure_client(self, tier_config: ResolvedTier[OptionsT] | None = None) -> Any:
+        """线程安全地惰性创建 OpenAI SDK 客户端并校验 API Key。"""
         with self._client_lock:
-            if self._client is None:
+            if self._client is not None:
+                return self._client
+            base_url = (
+                tier_config.base_url if tier_config and tier_config.base_url else None
+            ) or self.base_url
+            api_key_env = (
+                tier_config.api_key_env if tier_config and tier_config.api_key_env else None
+            ) or self.api_key_env
+            if not base_url:
+                raise ValueError(f"{self.provider_name} provider 需要配置 llm.base_url")
+            key = (base_url, api_key_env)
+            if key not in self._clients:
                 try:
                     from openai import OpenAI
                 except ImportError as error:  # pragma: no cover
@@ -161,21 +201,44 @@ class OpenAICompatibleBaseClient(LLMClient, Generic[OptionsT]):
                         "需要 openai SDK：pip install openai"
                         "（或把 llm.provider 设为 fake 做离线测试）"
                     ) from error
-                api_key = os.environ.get(self.api_key_env) if self.api_key_env else None
-                if (self.requires_api_key or self.api_key_env) and not api_key:
-                    raise RuntimeError(
-                        f"未设置环境变量 {self.api_key_env}（{self.provider_name} API key）"
-                    )
-                self._client = OpenAI(
+                self._validate_api_key_env(api_key_env)
+                api_key = os.environ.get(api_key_env) if api_key_env else None
+                self._clients[key] = OpenAI(
                     api_key=api_key or "no-key",
-                    base_url=self.base_url,
+                    base_url=base_url,
                     timeout=self.cfg.timeout,
+                    # 重试由 Wenyi 统一分类、退避和记录，禁止 SDK 再叠一层。
+                    max_retries=0,
                 )
-        return self._client
+            return self._clients[key]
+
+    def validate_credentials(self, tiers: Sequence[str] | None = None) -> None:
+        """在发起任何模型流程前报告缺失的 API Key 环境变量。"""
+        if tiers is None:
+            self._validate_api_key_env(self.api_key_env)
+            for tier_cfg in self.tiers.values():
+                if tier_cfg.api_key_env and tier_cfg.api_key_env != self.api_key_env:
+                    self._validate_api_key_env(tier_cfg.api_key_env)
+            return
+
+        for tier in tiers:
+            tier_cfg = self.tiers.get(tier)
+            api_key_env = (
+                tier_cfg.api_key_env if tier_cfg and tier_cfg.api_key_env else None
+            ) or self.api_key_env
+            self._validate_api_key_env(api_key_env)
 
     def _normalize_usage(self, usage: Any) -> UsageSample | None:
         """标准 OpenAI 兼容响应默认使用嵌套缓存明细。"""
         return normalize_openai_usage(usage)
+
+    def _json_response_fallback(
+        self,
+        tier_config: ResolvedTier[OptionsT],
+        message: Any,
+    ) -> str | None:
+        """返回显式启用的 JSON 响应备用字段；默认不信任任何非标准字段。"""
+        return None
 
     @abstractmethod
     def _build_request_kwargs(
@@ -184,7 +247,7 @@ class OpenAICompatibleBaseClient(LLMClient, Generic[OptionsT]):
         messages: Messages,
         *,
         json_mode: bool,
-        max_tokens: Optional[int],
+        max_tokens: int | None,
     ) -> dict[str, Any]:
         """把通用调用转换成 provider 的请求方言。"""
         raise NotImplementedError
@@ -195,9 +258,10 @@ class OpenAICompatibleBaseClient(LLMClient, Generic[OptionsT]):
         *,
         tier: str = "strong",
         json_mode: bool = False,
-        max_tokens: Optional[int] = None,
-        stage: Optional[str] = None,
+        max_tokens: int | None = None,
+        stage: str | None = None,
     ) -> str:
+        """按指定档位调用兼容接口，自动重试并记录标准化用量。"""
         tier_config = resolve_tier(self.tiers, tier)
         kwargs = self._build_request_kwargs(
             tier_config,
@@ -205,18 +269,48 @@ class OpenAICompatibleBaseClient(LLMClient, Generic[OptionsT]):
             json_mode=json_mode,
             max_tokens=max_tokens,
         )
-        client = self._ensure_client()
+        client = self._ensure_client(tier_config)
 
-        @retry(
-            stop=stop_after_attempt(self.cfg.max_retries + 1),
-            wait=wait_exponential(multiplier=1, max=30),
-            retry=retry_if_exception_type(Exception),
-            reraise=True,
+        request_id = self._new_request_id()
+        attempt = 0
+        reporter = RetryReporter(
+            provider=self.provider_name,
+            tier=tier,
+            stage=stage,
+            max_attempts=max(1, self.cfg.max_retries + 1),
+            emit=self._emit_event,
         )
+
+        @provider_retry(self.cfg.max_retries, reporter)
         def _call() -> str:
-            response = client.chat.completions.create(**kwargs)
-            sample = self._normalize_usage(getattr(response, "usage", None))
-            self.usage.record(tier, sample, stage)
-            return response.choices[0].message.content or ""
+            """执行一次实际请求；异常交由 tenacity 重试装饰器处理。"""
+            nonlocal attempt
+            attempt += 1
+            with self.request_status(
+                tier=tier, stage=stage, request_id=request_id, attempt=attempt
+            ):
+                response = client.chat.completions.create(**kwargs)
+                sample = self._normalize_usage(getattr(response, "usage", None))
+                self.usage.record(tier, sample, stage, provider=self.provider_name)
+                choice = response.choices[0]
+                message = choice.message
+                raw_content = getattr(message, "content", None)
+                content = raw_content if isinstance(raw_content, str) else ""
+                if not content.strip():
+                    if str(getattr(choice, "finish_reason", "")).lower() == "length":
+                        raise RuntimeError("OpenAI-compatible 响应因达到 token 上限而截断")
+                    fallback = (
+                        self._json_response_fallback(tier_config, message) if json_mode else None
+                    )
+                    if fallback is None or not fallback.strip():
+                        raise EmptyResponseError(f"{self.provider_name} 响应的 content 为空")
+                    try:
+                        json.loads(fallback)
+                    except json.JSONDecodeError as error:
+                        raise EmptyResponseError(
+                            f"{self.provider_name} 配置的 JSON 备用响应不是合法 JSON"
+                        ) from error
+                    content = fallback
+                return content
 
         return _call()

@@ -27,16 +27,17 @@ llm:
         thinking: true
         reasoning_effort: high
     fast:
-      model: gpt-5.6-luna
+      model: gpt-5.6-terra
       options:
-        thinking: false
+        thinking: true
+        reasoning_effort: low
 
 # ── 切分 ─────────────────────────────────────────────────────────────────
 segment:
-  # 一个翻译批次（句群）的目标大小，按字符粗略估算 token。
-  max_chars_per_batch: 1800
-  # 单个段落超过该长度时按句末标点再切成多段（续段回填时并回同段），避免超长段。
-  max_chars_per_segment: 1200
+  # 一个翻译批次（句群）的目标大小，按 token 计量（tiktoken cl100k_base）。
+  max_tokens_per_batch: 1800
+  # 单个段落超过该 token 预算时按句末标点再切成多段（续段回填时并回同段），避免超长段。
+  max_tokens_per_segment: 1200
 
 # ── 流水线开关（质量/成本平衡）───────────────────────────────────────────
 pipeline:

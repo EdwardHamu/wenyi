@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess
 import threading
 from pathlib import Path
 from typing import Any, Optional
@@ -22,6 +21,7 @@ from ...config import LLMConfig
 from ..base import LLMClient, Messages
 from ..tiers import resolve_tier
 from ..usage import UsageSample, read_usage_int
+from ._cli import run_cli_process
 from ._openai_compatible import ResolvedTier, resolve_provider_tiers
 
 _JSON_MODE_INSTRUCTION = "Return only valid JSON, with no markdown fence or explanation."
@@ -78,7 +78,9 @@ def parse_codex_events(output: str) -> tuple[str, UsageSample | None]:
         try:
             event = json.loads(line)
         except ValueError as error:
-            raise RuntimeError(f"codex CLI output contains non-JSONL data: {line[:500]!r}") from error
+            raise RuntimeError(
+                f"codex CLI output contains non-JSONL data: {line[:500]!r}"
+            ) from error
         if event.get("type") == "item.completed":
             item = event.get("item") or {}
             if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
@@ -93,13 +95,19 @@ def parse_codex_events(output: str) -> tuple[str, UsageSample | None]:
 class CodexClient(LLMClient):
     """Use locally authenticated `codex exec --json` requests."""
 
-    def __init__(self, cfg: LLMConfig):
+    def __init__(self, cfg: LLMConfig, *, require_strong: bool = True):
         super().__init__()
+        self.provider_name = "Codex"
         self.cfg = cfg
         if cfg.base_url or cfg.api_key_env:
-            print("codex provider uses the local Codex CLI; llm.base_url / api_key_env are ignored.")
+            print(
+                "codex provider uses the local Codex CLI; llm.base_url / api_key_env are ignored."
+            )
         self.tiers = resolve_provider_tiers(
-            cfg.tiers, options_type=CodexTierOptions, defaults=_default_tiers()
+            cfg.tiers,
+            options_type=CodexTierOptions,
+            defaults=_default_tiers(),
+            require_strong=require_strong,
         )
         self._cli_path: str | None = None
         self._cli_path_lock = threading.Lock()
@@ -135,8 +143,10 @@ class CodexClient(LLMClient):
                 ]
         return self._mcp_disable_cache
 
-    def _ensure_cli_path(self) -> str:
+    def _ensure_cli_path(self, tier_config: ResolvedTier[CodexTierOptions] | None = None) -> str:
         with self._cli_path_lock:
+            if tier_config and tier_config.cli_path:
+                return tier_config.cli_path
             if self._cli_path is None:
                 path = self.cfg.cli_path or shutil.which("codex")
                 if not path:
@@ -158,16 +168,30 @@ class CodexClient(LLMClient):
         del max_tokens
         tier_config = resolve_tier(self.tiers, tier)
         argv = [
-            self._ensure_cli_path(), "exec", "--ephemeral", "--skip-git-repo-check",
+            self._ensure_cli_path(tier_config),
+            "exec",
+            "--ephemeral",
+            "--skip-git-repo-check",
             # mcp_servers={} 会被非破坏性合并而静默失效（openai/codex#16045），
             # 必须按名逐个 enabled=false 才能真正阻止 MCP server 启动。
-            "--config", "mcp_servers={}",
+            "--config",
+            "mcp_servers={}",
             *self._mcp_disable_args(),
-            "--sandbox", "read-only", "--color", "never", "--json", "--model",
-            tier_config.model, "--config",
-            f'model_reasoning_effort="{tier_config.options.reasoning_effort}"', "-",
+            "--sandbox",
+            "read-only",
+            "--color",
+            "never",
+            "--json",
+            "--model",
+            tier_config.model,
+            "--config",
+            f'model_reasoning_effort="{tier_config.options.reasoning_effort}"',
+            "-",
         ]
         prompt = build_codex_prompt(messages, json_mode=json_mode)
+
+        request_id = self._new_request_id()
+        attempt = 0
 
         @retry(
             stop=stop_after_attempt(self.cfg.max_retries + 1),
@@ -176,14 +200,21 @@ class CodexClient(LLMClient):
             reraise=True,
         )
         def _call() -> str:
-            proc = subprocess.run(
-                argv, input=prompt, capture_output=True, text=True,
-                timeout=self.cfg.timeout, encoding="utf-8",
-            )
-            if proc.returncode != 0:
-                raise RuntimeError(f"codex CLI exited {proc.returncode}: {proc.stderr[:500]}")
-            text, usage = parse_codex_events(proc.stdout)
-            self.usage.record(tier, usage, stage)
-            return text
+            nonlocal attempt
+            attempt += 1
+            with self.request_status(
+                tier=tier, stage=stage, request_id=request_id, attempt=attempt
+            ):
+                proc = run_cli_process(
+                    argv,
+                    input_text=prompt,
+                    timeout=self.cfg.timeout,
+                    provider="Codex",
+                )
+                if proc.returncode != 0:
+                    raise RuntimeError(f"codex CLI exited {proc.returncode}: {proc.stderr[:500]}")
+                text, usage = parse_codex_events(proc.stdout)
+                self.usage.record(tier, usage, stage, provider=self.provider_name)
+                return text
 
         return _call()
