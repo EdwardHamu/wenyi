@@ -465,7 +465,7 @@ class TestAnthropicProvider(unittest.TestCase):
 
         self.assertIn("json", system_prompt)
 
-    def test_multiple_non_system_messages_join_into_stdin_text(self):
+    def test_multiple_non_system_messages_preserve_roles_in_stdin_text(self):
         from trans_novel.llm.providers._openai_compatible import ResolvedTier
         from trans_novel.llm.providers.anthropic import (
             AnthropicTierOptions,
@@ -477,10 +477,14 @@ class TestAnthropicProvider(unittest.TestCase):
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "first"},
             {"role": "assistant", "content": "second"},
+            {"role": "user", "content": "third"},
         ]
         _, _, stdin_text = build_cli_invocation(tier, messages)
 
-        self.assertEqual(stdin_text, "first\n\nsecond")
+        self.assertEqual(
+            stdin_text,
+            "[USER]\nfirst\n\n[ASSISTANT]\nsecond\n\n[USER]\nthird",
+        )
 
     def test_usage_normalization_treats_cache_write_as_miss(self):
         from trans_novel.llm.providers.anthropic import normalize_anthropic_usage
@@ -1440,6 +1444,26 @@ class TestPiProvider(unittest.TestCase):
         self.assertEqual(extra_argv[extra_argv.index("--model") + 1], "deepseek-v4-pro")
         self.assertEqual(extra_argv[extra_argv.index("--thinking") + 1], "high")
 
+    def test_invocation_preserves_roles_for_multiturn_transcript(self):
+        from trans_novel.llm.providers._openai_compatible import ResolvedTier
+        from trans_novel.llm.providers.pi import PiTierOptions, build_pi_invocation
+
+        tier = ResolvedTier(model="m", options=PiTierOptions(thinking=False))
+        _, _, stdin_text = build_pi_invocation(
+            tier,
+            [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "second"},
+                {"role": "user", "content": "third"},
+            ],
+        )
+
+        self.assertEqual(
+            stdin_text,
+            "[USER]\nfirst\n\n[ASSISTANT]\nsecond\n\n[USER]\nthird",
+        )
+
     def test_thinking_disabled_uses_off(self):
         from trans_novel.llm.providers._openai_compatible import ResolvedTier
         from trans_novel.llm.providers.pi import PiTierOptions, build_pi_invocation
@@ -2376,6 +2400,24 @@ class TestCodeBuddyProvider(unittest.TestCase):
         self.assertIn("你是译者。", system_prompt)
         self.assertIn("valid json", system_prompt)
         self.assertEqual(stdin_text, "翻译这句话。")
+
+    def test_invocation_preserves_roles_for_multiturn_transcript(self):
+        from trans_novel.llm.providers.codebuddy import build_cli_invocation
+
+        _, _, stdin_text = build_cli_invocation(
+            self._tier_config(thinking=False),
+            [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "second"},
+                {"role": "user", "content": "third"},
+            ],
+        )
+
+        self.assertEqual(
+            stdin_text,
+            "[USER]\nfirst\n\n[ASSISTANT]\nsecond\n\n[USER]\nthird",
+        )
 
     def test_invocation_omits_effort_when_thinking_disabled(self):
         from trans_novel.llm.providers.codebuddy import build_cli_invocation

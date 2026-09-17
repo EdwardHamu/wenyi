@@ -27,7 +27,7 @@ from ...config import LLMConfig
 from ..base import LLMClient, Messages
 from ..tiers import resolve_tier
 from ..usage import UsageSample, read_usage_int
-from ._cli import run_cli_process
+from ._cli import render_cli_chat_messages, run_cli_process
 from ._openai_compatible import ResolvedTier, resolve_provider_tiers
 
 _JSON_MODE_INSTRUCTION = "Output must be valid json."
@@ -124,15 +124,14 @@ def build_cli_invocation(
     返回 (extra_argv, system_prompt_text, stdin_text)：
     - extra_argv：追加到固定 CLI flags 后的档位专属参数（--model、可选 --effort）
     - system_prompt_text：喂给 `--system-prompt` 的文本（json_mode 时追加指令）
-    - stdin_text：喂给 `-p` 的 stdin 内容（非 system 消息按顺序拼接；正常场景下
-      调用方只传一条 system + 一条 user，多条消息只是兜底不炸）
+    - stdin_text：喂给 `-p` 的 stdin 内容（单轮保持原始正文，多轮保留角色标记）
     """
     system_text, chat_messages = _split_system(messages)
     if json_mode:
         system_text = (
             f"{system_text}\n\n{_JSON_MODE_INSTRUCTION}" if system_text else _JSON_MODE_INSTRUCTION
         )
-    stdin_text = "\n\n".join(str(message.get("content", "")) for message in chat_messages)
+    stdin_text = render_cli_chat_messages(chat_messages)
     extra_argv: list[str] = ["--model", tier_config.model]
     if tier_config.options.thinking:
         extra_argv += ["--effort", tier_config.options.reasoning_effort]

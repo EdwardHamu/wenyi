@@ -47,7 +47,11 @@ from ...config import LLMConfig
 from ..base import LLMClient, Messages
 from ..tiers import resolve_tier
 from ..usage import UsageSample, read_usage_int
-from ._cli import run_cli_process, terminate_all_active_processes
+from ._cli import (
+    render_cli_chat_messages,
+    run_cli_process,
+    terminate_all_active_processes,
+)
 from ._openai_compatible import ResolvedTier, resolve_provider_tiers
 
 _JSON_MODE_INSTRUCTION = "Return only valid JSON, with no markdown fence or explanation."
@@ -569,14 +573,14 @@ def build_pi_invocation(
     - extra_argv：追加到固定 CLI flags 后的档位专属参数（--model、--thinking）
     - system_prompt_text：喂给 `--system-prompt`（临时文件）的文本
       （json_mode 时追加 JSON 指令）
-    - stdin_text：喂给 `-p` 的 stdin 内容（非 system 消息按顺序拼接）
+    - stdin_text：喂给 `-p` 的 stdin 内容（多轮消息保留角色标记）
     """
     system_text, chat_messages = _split_system(messages)
     if json_mode:
         system_text = (
             f"{system_text}\n\n{_JSON_MODE_INSTRUCTION}" if system_text else _JSON_MODE_INSTRUCTION
         )
-    stdin_text = "\n\n".join(str(message.get("content", "")) for message in chat_messages)
+    stdin_text = render_cli_chat_messages(chat_messages)
     extra_argv: list[str] = ["--model", tier_config.model]
     if tier_config.options.thinking:
         extra_argv += ["--thinking", tier_config.options.reasoning_effort]

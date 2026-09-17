@@ -5,11 +5,28 @@ from __future__ import annotations
 import subprocess
 import sys
 import threading
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 _ACTIVE_PROCESSES: set[subprocess.Popen] = set()
 _ACTIVE_LOCK = threading.Lock()
+
+
+def render_cli_chat_messages(messages: Sequence[Mapping[str, Any]]) -> str:
+    """Render non-system chat messages for one-shot CLI providers.
+
+    Preserve the legacy raw payload for the overwhelmingly common single-message request. For a
+    replayed multi-turn transcript, retain role boundaries so previous assistant output cannot be
+    mistaken for another user instruction.
+    """
+    rows = [
+        (str(message.get("role", "user") or "user").upper(), str(message.get("content", "")))
+        for message in messages
+        if message.get("content", "")
+    ]
+    if len(rows) <= 1:
+        return rows[0][1] if rows else ""
+    return "\n\n".join(f"[{role}]\n{content}" for role, content in rows)
 
 
 def cli_launch_error(

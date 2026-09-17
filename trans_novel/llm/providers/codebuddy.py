@@ -35,7 +35,7 @@ from ...config import LLMConfig
 from ..base import LLMClient, Messages
 from ..tiers import resolve_tier
 from ..usage import UsageSample
-from ._cli import run_cli_process
+from ._cli import render_cli_chat_messages, run_cli_process
 from ._openai_compatible import ResolvedTier, resolve_provider_tiers
 from .anthropic import _split_system, normalize_anthropic_usage
 
@@ -89,7 +89,7 @@ def build_cli_invocation(
         system_text = (
             f"{system_text}\n\n{_JSON_MODE_INSTRUCTION}" if system_text else _JSON_MODE_INSTRUCTION
         )
-    stdin_text = "\n\n".join(str(message.get("content", "")) for message in chat_messages)
+    stdin_text = render_cli_chat_messages(chat_messages)
     extra_argv: list[str] = ["--model", tier_config.model]
     if tier_config.options.thinking:
         extra_argv += ["--effort", tier_config.options.reasoning_effort]
