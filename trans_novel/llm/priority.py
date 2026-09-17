@@ -9,7 +9,16 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 from ..config import Config, LLMConfig
-from .base import LLMClient, Messages, RequestEvent
+from .base import (
+    ConversationCompletion,
+    JsonConversationCompletion,
+    LLMClient,
+    Messages,
+    NativeConversation,
+    NativeConversationInvalidError,
+    NativeConversationRouteChangedError,
+    RequestEvent,
+)
 from .providers.pi import (
     AUDIT_ALERT_TOTAL_TIMEOUT,
     PiAuditError,
@@ -131,6 +140,17 @@ class PriorityLLMClient(LLMClient):
         for idx in self._priority_order:
             _validate_client_credentials(self._clients[idx], tiers)
 
+    def owns_conversation(self, handle: NativeConversation) -> bool:
+        return any(client.owns_conversation(handle) for client in self._clients.values())
+
+    def close_conversation(self, handle: NativeConversation) -> None:
+        matches = [client for client in self._clients.values() if client.owns_conversation(handle)]
+        if len(matches) != 1:
+            raise NativeConversationInvalidError(
+                "native conversation is not owned by this priority client"
+            )
+        matches[0].close_conversation(handle)
+
     def _check_recovery_under_lock(self) -> None:
         """若已跨过 10 分钟静默期且当前处于降级档位，恢复为首选配置。"""
         if self._current_step > 0 and self._last_audit_time is not None:
@@ -202,6 +222,146 @@ class PriorityLLMClient(LLMClient):
             )
         except Exception as exc:
             _record_audit_notification_failure("降级通知", exc)
+
+    def start_conversation(
+        self,
+        messages: Messages,
+        *,
+        tier: str = "strong",
+        json_mode: bool = False,
+        max_tokens: int | None = None,
+        stage: str | None = None,
+    ) -> ConversationCompletion:
+        while True:
+            with self._lock:
+                self._check_recovery_under_lock()
+                step = self._current_step
+                cfg_idx = self._priority_order[step]
+                client = self._clients[cfg_idx]
+            try:
+                return client.start_conversation(
+                    messages,
+                    tier=tier,
+                    json_mode=json_mode,
+                    max_tokens=max_tokens,
+                    stage=stage,
+                )
+            except PiAuditError as audit_err:
+                self._handle_audit_failover(
+                    step=step,
+                    operation="start_conversation",
+                    stage=stage,
+                    tier=tier,
+                    error=audit_err,
+                )
+
+    def start_json_conversation(
+        self,
+        messages: Messages,
+        *,
+        tier: str = "strong",
+        max_tokens: int | None = None,
+        stage: str | None = None,
+    ) -> JsonConversationCompletion:
+        while True:
+            with self._lock:
+                self._check_recovery_under_lock()
+                step = self._current_step
+                cfg_idx = self._priority_order[step]
+                client = self._clients[cfg_idx]
+            try:
+                try:
+                    return client.start_json_conversation(
+                        messages,
+                        tier=tier,
+                        max_tokens=max_tokens,
+                        stage=stage,
+                    )
+                finally:
+                    self._request_context.last_json_response = client.last_json_response()
+                    self._request_context.last_json_request_id = client.last_json_request_id()
+            except PiAuditError as audit_err:
+                self._handle_audit_failover(
+                    step=step,
+                    operation="start_json_conversation",
+                    stage=stage,
+                    tier=tier,
+                    error=audit_err,
+                )
+
+    def _active_conversation_client(self, handle: NativeConversation) -> tuple[int, LLMClient]:
+        with self._lock:
+            self._check_recovery_under_lock()
+            step = self._current_step
+            cfg_idx = self._priority_order[step]
+            client = self._clients[cfg_idx]
+        if handle.config_index != cfg_idx or not client.owns_conversation(handle):
+            raise NativeConversationRouteChangedError(
+                "LLM priority route changed after the translation turn"
+            )
+        return step, client
+
+    def continue_conversation(
+        self,
+        handle: NativeConversation,
+        user_message: str,
+        *,
+        json_mode: bool = False,
+        max_tokens: int | None = None,
+        stage: str | None = None,
+    ) -> ConversationCompletion:
+        step, client = self._active_conversation_client(handle)
+        try:
+            return client.continue_conversation(
+                handle,
+                user_message,
+                json_mode=json_mode,
+                max_tokens=max_tokens,
+                stage=stage,
+            )
+        except PiAuditError as audit_err:
+            self._handle_audit_failover(
+                step=step,
+                operation="continue_conversation",
+                stage=stage,
+                tier=handle.tier,
+                error=audit_err,
+            )
+            raise NativeConversationRouteChangedError(
+                "native conversation failed and the priority route changed"
+            ) from audit_err
+
+    def continue_json_conversation(
+        self,
+        handle: NativeConversation,
+        user_message: str,
+        *,
+        max_tokens: int | None = None,
+        stage: str | None = None,
+    ) -> JsonConversationCompletion:
+        step, client = self._active_conversation_client(handle)
+        try:
+            try:
+                return client.continue_json_conversation(
+                    handle,
+                    user_message,
+                    max_tokens=max_tokens,
+                    stage=stage,
+                )
+            finally:
+                self._request_context.last_json_response = client.last_json_response()
+                self._request_context.last_json_request_id = client.last_json_request_id()
+        except PiAuditError as audit_err:
+            self._handle_audit_failover(
+                step=step,
+                operation="continue_json_conversation",
+                stage=stage,
+                tier=handle.tier,
+                error=audit_err,
+            )
+            raise NativeConversationRouteChangedError(
+                "native conversation failed and the priority route changed"
+            ) from audit_err
 
     def complete(
         self,

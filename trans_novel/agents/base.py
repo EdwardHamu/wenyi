@@ -11,7 +11,7 @@ import json
 from typing import Any
 
 from ..config import Config
-from ..llm.base import LLMClient, Messages
+from ..llm.base import JsonConversationCompletion, LLMClient, Messages
 
 _RAISE = object()  # 哨兵：未提供 default 时异常照常抛出，由调用方自理
 
@@ -42,6 +42,21 @@ class Agent:
         if not raw:
             raw = json.dumps(data, ensure_ascii=False)
         return data, raw
+
+    def _start_json_conversation_turn(
+        self,
+        messages: Messages,
+        *,
+        tier: str,
+        max_tokens: int | None = None,
+    ) -> JsonConversationCompletion:
+        """请求 JSON 首轮，同时保留原始 assistant 文本与可选原生 handle。"""
+        return self.client.start_json_conversation(
+            messages,
+            tier=tier,
+            max_tokens=max_tokens,
+            stage=type(self).__name__,
+        )
 
     def _ask_json(
         self,

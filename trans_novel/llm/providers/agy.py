@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import threading
 import traceback
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal, Optional
 
@@ -14,7 +16,14 @@ from pydantic import BaseModel, ConfigDict, field_validator
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from ...config import LLMConfig
-from ..base import LLMClient, Messages
+from ..base import (
+    ConversationCompletion,
+    LLMClient,
+    Messages,
+    NativeConversation,
+    NativeConversationInvalidError,
+    conversation_fingerprint,
+)
 from ..tiers import resolve_tier
 from ..usage import UsageSample, read_usage_int
 from ._cli import run_cli_process
@@ -24,6 +33,7 @@ _JSON_MODE_INSTRUCTION = "Return only valid JSON, with no markdown fence or expl
 AGY_ERROR_LOG_FILE = "agy_errors.log"
 _AGY_ERROR_LOGGED_ATTRIBUTE = "_agy_error_logged"
 _AGY_ERROR_LOG_LOCK = threading.Lock()
+_AGY_CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9][^\s\x00-\x1f\x7f]{0,511}$")
 
 
 def _agy_error_log_path() -> str:
@@ -188,13 +198,22 @@ def normalize_agy_usage(usage: Any) -> UsageSample | None:
     )
 
 
-def parse_agy_events(
+@dataclass(frozen=True, slots=True)
+class AgyParsedEvents:
+    text: str
+    usage: UsageSample | None
+    conversation_id: str | None
+
+
+def _parse_agy_events_full(
     output: str,
     stderr: str = "",
     *,
     error_context: dict[str, Any] | None = None,
-) -> tuple[str, UsageSample | None]:
-    """解析 Agy CLI 的 NDJSON 输出，提取回复文本与用量统计。"""
+    require_conversation_id: bool = False,
+    expected_conversation_id: str | None = None,
+) -> AgyParsedEvents:
+    """解析 Agy NDJSON，并在原生会话路径严格校验 conversation ID。"""
     log_context = dict(error_context or {})
     # stderr is supplied as a dedicated argument below; do not pass it again
     # through the extensible context mapping.
@@ -215,6 +234,24 @@ def parse_agy_events(
         raise error
 
     result_event: dict[str, Any] | None = None
+    conversation_ids: list[tuple[str, str]] = []
+    validate_conversation_id = require_conversation_id or expected_conversation_id is not None
+
+    def collect_conversation_id(container: dict[str, Any], source: str) -> None:
+        if not validate_conversation_id:
+            return
+        for key in ("conversation_id", "conversationId"):
+            if key not in container:
+                continue
+            value = container[key]
+            if (
+                not isinstance(value, str)
+                or value != value.strip()
+                or _AGY_CONVERSATION_ID_RE.fullmatch(value) is None
+            ):
+                fail(f"agy CLI returned invalid {source} {key}: {value!r}")
+            conversation_ids.append((source, value))
+
     try:
         for line in output.splitlines():
             line = line.strip()
@@ -224,7 +261,12 @@ def parse_agy_events(
                 event = json.loads(line)
             except (ValueError, json.JSONDecodeError) as error:
                 fail(f"agy CLI output contains non-JSON data: {line[:500]!r}", cause=error)
-            if isinstance(event, dict) and event.get("event") == "result":
+            if not isinstance(event, dict):
+                continue
+            event_kind = event.get("event") or event.get("type")
+            if event_kind == "init" or event.get("subtype") == "init":
+                collect_conversation_id(event, "init")
+            if event.get("event") == "result":
                 result_event = event
 
         if result_event is None:
@@ -233,6 +275,7 @@ def parse_agy_events(
         result_data = result_event.get("result", result_event)
         if not isinstance(result_data, dict):
             fail(f"agy CLI result event has invalid result payload: {result_event!r}")
+        collect_conversation_id(result_data, "result")
 
         status = result_data.get("status")
         if status != "SUCCESS":
@@ -248,7 +291,19 @@ def parse_agy_events(
         if usage_data is None and ("input_tokens" in result_data or "output_tokens" in result_data):
             usage_data = result_data
         usage = normalize_agy_usage(usage_data)
-        return response, usage
+        unique_ids = {conversation_id for _source, conversation_id in conversation_ids}
+        if len(unique_ids) > 1:
+            rendered = ", ".join(f"{source}={value!r}" for source, value in conversation_ids)
+            fail(f"agy CLI returned conflicting conversation IDs: {rendered}")
+        conversation_id = next(iter(unique_ids), None)
+        if require_conversation_id and conversation_id is None:
+            fail("agy CLI did not return a conversation ID")
+        if expected_conversation_id is not None and conversation_id != expected_conversation_id:
+            fail(
+                "agy CLI resumed a different conversation ID: "
+                f"expected {expected_conversation_id!r}, got {conversation_id!r}"
+            )
+        return AgyParsedEvents(response, usage, conversation_id)
     except Exception as error:
         if not getattr(error, _AGY_ERROR_LOGGED_ATTRIBUTE, False):
             _log_agy_error(
@@ -261,7 +316,24 @@ def parse_agy_events(
         raise
 
 
+def parse_agy_events(
+    output: str,
+    stderr: str = "",
+    *,
+    error_context: dict[str, Any] | None = None,
+) -> tuple[str, UsageSample | None]:
+    """向后兼容解析入口；普通 complete 不强制旧版事件提供 conversation ID。"""
+    parsed = _parse_agy_events_full(output, stderr, error_context=error_context)
+    return parsed.text, parsed.usage
+
+
 parse_agy_output = parse_agy_events
+
+
+@dataclass(frozen=True, slots=True)
+class _AgyConversationPayload:
+    argv: tuple[str, ...]
+    json_mode: bool
 
 
 class AgyClient(LLMClient):
@@ -312,6 +384,191 @@ class AgyClient(LLMClient):
                     )
                 self._cli_path = path
         return self._cli_path
+
+    def _run_conversation_attempt(
+        self,
+        argv: list[str],
+        stdin_payload: str,
+        *,
+        cwd: str,
+        request_id: int,
+        tier: str,
+        stage: str | None,
+        attempt: int,
+        json_mode: bool,
+        expected_conversation_id: str | None = None,
+    ) -> AgyParsedEvents:
+        proc = None
+        try:
+            with self.request_status(
+                tier=tier,
+                stage=stage,
+                request_id=request_id,
+                attempt=attempt,
+            ):
+                proc = run_cli_process(
+                    argv,
+                    input_text=stdin_payload,
+                    timeout=self.cfg.timeout,
+                    provider="Agy",
+                    cwd=cwd,
+                )
+                if proc.returncode != 0:
+                    raise RuntimeError(f"agy CLI exited {proc.returncode}: {proc.stderr[:500]}")
+                parsed = _parse_agy_events_full(
+                    proc.stdout,
+                    proc.stderr,
+                    error_context={
+                        "request_id": request_id,
+                        "tier": tier,
+                        "stage": stage,
+                        "attempt": attempt,
+                        "json_mode": json_mode,
+                        "argv": argv,
+                    },
+                    require_conversation_id=True,
+                    expected_conversation_id=expected_conversation_id,
+                )
+                self.usage.record(tier, parsed.usage, stage, provider=self.provider_name)
+                return parsed
+        except Exception as error:
+            if not getattr(error, _AGY_ERROR_LOGGED_ATTRIBUTE, False):
+                stdout = getattr(proc, "stdout", None)
+                if stdout is None:
+                    stdout = getattr(error, "stdout", None) or getattr(error, "output", None)
+                stderr = getattr(proc, "stderr", None)
+                if stderr is None:
+                    stderr = getattr(error, "stderr", None)
+                _log_agy_error(
+                    error,
+                    operation="agy_cli_attempt",
+                    request_id=request_id,
+                    tier=tier,
+                    stage=stage,
+                    attempt=attempt,
+                    json_mode=json_mode,
+                    argv=argv,
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+            raise
+
+    def start_conversation(
+        self,
+        messages: Messages,
+        *,
+        tier: str = "strong",
+        json_mode: bool = False,
+        max_tokens: Optional[int] = None,
+        stage: Optional[str] = None,
+    ) -> ConversationCompletion:
+        del max_tokens
+        tier_config = resolve_tier(self.tiers, tier)
+        cli_path = self._ensure_cli_path(tier_config)
+        argv = build_agy_argv(cli_path, tier_config)
+        stdin_payload = build_agy_input_payload(build_agy_prompt(messages, json_mode=json_mode))
+        request_id = self._new_request_id()
+        cwd = os.path.abspath(os.getcwd())
+        attempt = 0
+
+        @retry(
+            stop=stop_after_attempt(self.cfg.max_retries + 1),
+            wait=wait_exponential(multiplier=1, max=30),
+            retry=retry_if_exception_type(Exception),
+            reraise=True,
+        )
+        def _call_fresh() -> ConversationCompletion:
+            nonlocal attempt
+            attempt += 1
+            parsed = self._run_conversation_attempt(
+                argv,
+                stdin_payload,
+                cwd=cwd,
+                request_id=request_id,
+                tier=tier,
+                stage=stage,
+                attempt=attempt,
+                json_mode=json_mode,
+            )
+            conversation_id = parsed.conversation_id
+            if conversation_id is None:
+                raise NativeConversationInvalidError(
+                    "Agy conversation ID is missing after validation"
+                )
+            handle = NativeConversation(
+                provider=self.provider_name,
+                config_index=self.config_index,
+                tier=tier,
+                model=tier_config.model,
+                native_id=conversation_id,
+                cwd=cwd,
+                prefix_hash=conversation_fingerprint(messages),
+                _owner=self,
+                payload=_AgyConversationPayload(tuple(argv), json_mode),
+            )
+            self.emit_event(
+                "native_session_started",
+                provider=self.provider_name,
+                model=tier_config.model,
+                config_index=handle.config_index,
+                session_id_hash=handle.id_hash,
+            )
+            return ConversationCompletion(parsed.text, handle, request_id)
+
+        return _call_fresh()
+
+    def continue_conversation(
+        self,
+        handle: NativeConversation,
+        user_message: str,
+        *,
+        json_mode: bool = False,
+        max_tokens: Optional[int] = None,
+        stage: Optional[str] = None,
+    ) -> ConversationCompletion:
+        del max_tokens
+        handle.claim(self)
+        request_id = self._new_request_id()
+        payload = handle.payload
+        try:
+            if not isinstance(payload, _AgyConversationPayload):
+                raise NativeConversationInvalidError("invalid Agy conversation payload")
+            if payload.json_mode != json_mode:
+                raise NativeConversationInvalidError(
+                    "Agy conversation JSON mode cannot change during continuation"
+                )
+            if not os.path.isdir(handle.cwd):
+                raise NativeConversationInvalidError(
+                    "Agy conversation working directory no longer exists"
+                )
+            argv = [*payload.argv, "--conversation", handle.native_id]
+            # 只发送新增 user event；禁止使用依赖全局最近会话的裸 --continue。
+            stdin_payload = build_agy_input_payload(user_message)
+            parsed = self._run_conversation_attempt(
+                argv,
+                stdin_payload,
+                cwd=handle.cwd,
+                request_id=request_id,
+                tier=handle.tier,
+                stage=stage,
+                attempt=1,
+                json_mode=json_mode,
+                expected_conversation_id=handle.native_id,
+            )
+            return ConversationCompletion(parsed.text, request_id=request_id)
+        finally:
+            self.close_conversation(handle)
+
+    def close_conversation(self, handle: NativeConversation) -> None:
+        first_close = handle.mark_closed(self)
+        if first_close:
+            self.emit_event(
+                "native_session_closed",
+                provider=self.provider_name,
+                model=handle.model,
+                config_index=handle.config_index,
+                session_id_hash=handle.id_hash,
+            )
 
     def complete(
         self,

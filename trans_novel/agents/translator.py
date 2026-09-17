@@ -9,9 +9,11 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from ..config import Config
 from ..glossary.store import GlossaryTerm
-from ..llm.base import LLMClient
+from ..llm.base import LLMClient, NativeConversation
 from ..llm.json_parser import JsonParseError
 from . import langprofile, prompts
 from .base import Agent, Messages
@@ -23,6 +25,21 @@ class AlignmentError(Exception):
     def __init__(self, message: str, *, reason: str):
         super().__init__(message)
         self.reason = reason
+
+
+@dataclass(slots=True)
+class BatchContinuation:
+    """成功整批翻译后立即润色所需的批次局部上下文。"""
+
+    transcript: Messages
+    translated_indices: list[int]
+    native_handle: NativeConversation | None = None
+
+
+@dataclass(slots=True)
+class TranslationBatchResult:
+    targets: list[str]
+    continuation: BatchContinuation | None = None
 
 
 class Translator(Agent):
@@ -86,7 +103,8 @@ class Translator(Agent):
         chapter_digest: str = "",
         annotation_contexts: list[list[dict[str, str]]] | None = None,
         next_source: str = "",
-    ) -> tuple[list[str], Messages]:
+        capture_conversation: bool = False,
+    ) -> tuple[list[str], Messages, NativeConversation | None]:
         """调用一次批量翻译，并严格校验输出类型、数量和非空性。"""
         n = len(sources)
         system = prompts.render(
@@ -116,33 +134,51 @@ class Translator(Agent):
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
-        # Provider 瞬时错误只由传输层重试；这里仅把成功响应中的 JSON
-        # 协议错误归入对齐恢复，避免 401/403/5xx 被业务层再次放大。
+        native_handle: NativeConversation | None = None
         try:
-            data, raw = self._complete_json_turn(messages, tier="strong")
-        except JsonParseError as error:
-            raise AlignmentError(
-                "模型返回的译文 JSON 无法解析",
-                reason="invalid_json",
-            ) from error
-        items = data.get("translations") if isinstance(data, dict) else data
-        if not isinstance(items, list):
-            raise AlignmentError("模型未返回译文数组", reason="translations_not_list")
-        if len(items) != n:
-            raise AlignmentError(
-                f"译文数量不匹配：期望 {n} 段，实际 {len(items)} 段",
-                reason="translations_count_mismatch",
-            )
-        if any(not isinstance(item, str) or not item.strip() for item in items):
-            raise AlignmentError(
-                "模型返回了空译文或非字符串译文",
-                reason="translations_empty_or_non_string",
-            )
-        turn: Messages = [
-            *messages,
-            {"role": "assistant", "content": raw},
-        ]
-        return items, turn
+            # Provider 瞬时错误只由传输层重试；这里只把成功响应中的 JSON
+            # 协议错误归入对齐恢复，避免 401/403/5xx 被业务层再次放大。
+            try:
+                if capture_conversation:
+                    completion = self._start_json_conversation_turn(
+                        messages,
+                        tier="strong",
+                    )
+                    data = completion.data
+                    raw = completion.text
+                    native_handle = completion.handle
+                else:
+                    data, raw = self._complete_json_turn(messages, tier="strong")
+            except JsonParseError as error:
+                raise AlignmentError(
+                    "模型返回的译文 JSON 无法解析",
+                    reason="invalid_json",
+                ) from error
+            items = data.get("translations") if isinstance(data, dict) else data
+            if not isinstance(items, list):
+                raise AlignmentError("模型未返回译文数组", reason="translations_not_list")
+            if len(items) != n:
+                raise AlignmentError(
+                    f"译文数量不匹配：期望 {n} 段，实际 {len(items)} 段",
+                    reason="translations_count_mismatch",
+                )
+            if any(not isinstance(item, str) or not item.strip() for item in items):
+                raise AlignmentError(
+                    "模型返回了空译文或非字符串译文",
+                    reason="translations_empty_or_non_string",
+                )
+            turn: Messages = [
+                *messages,
+                {"role": "assistant", "content": raw},
+            ]
+            return items, turn, native_handle
+        except BaseException:
+            if native_handle is not None:
+                try:
+                    self.client.close_conversation(native_handle)
+                except BaseException:
+                    pass
+            raise
 
     def _log_rejected_response(
         self,
@@ -184,7 +220,7 @@ class Translator(Agent):
         next_source: str = "",
     ) -> str:
         """借用批量协议翻译单段，作为批量对齐失败后的最终兜底。"""
-        out, _turn = self._call_batch(
+        out, _turn, _handle = self._call_batch(
             [source],
             glossary_terms,
             style,
@@ -196,7 +232,7 @@ class Translator(Agent):
         )
         return out[0]
 
-    def translate_batch(
+    def translate_batch_result(
         self,
         sources: list[str],
         *,
@@ -207,34 +243,33 @@ class Translator(Agent):
         chapter_digest: str = "",
         annotation_contexts: list[list[dict[str, str]]] | None = None,
         next_source: str = "",
-    ) -> list[str]:
-        """翻译一批源段，返回与之等长的译文列表。"""
-        self.last_batch_turn = None
-        self.last_batch_indices = None
+        capture_conversation: bool = False,
+    ) -> TranslationBatchResult:
+        """翻译一批源段，并显式返回仅属于该批次的润色上下文。"""
         glossary_terms = glossary_terms or []
         n = len(sources)
         annotation_contexts = self._validate_annotation_contexts(sources, annotation_contexts)
         if n == 0:
-            return []
+            return TranslationBatchResult([])
 
         translated_indices = [
             index for index, source in enumerate(sources) if self._needs_translation(source)
         ]
         if not translated_indices:
-            return list(sources)
+            return TranslationBatchResult(list(sources))
         translated_sources = [sources[index] for index in translated_indices]
         translated_annotation_contexts = [
             annotation_contexts[index] for index in translated_indices
         ]
 
-        # 批内末尾被过滤的纯数字/符号段优先作为直接后文
+        # 批内末尾被过滤的纯数字/符号段优先作为直接后文。
         following_index = translated_indices[-1] + 1
         batch_next_source = sources[following_index] if following_index < n else next_source
 
         attempts = self.config.pipeline.align_retry_limit + 1
         for attempt in range(1, attempts + 1):
             try:
-                translated, turn = self._call_batch(
+                translated, turn, native_handle = self._call_batch(
                     translated_sources,
                     glossary_terms,
                     style,
@@ -243,15 +278,20 @@ class Translator(Agent):
                     chapter_digest,
                     translated_annotation_contexts,
                     next_source=batch_next_source,
+                    capture_conversation=capture_conversation,
                 )
                 targets = list(sources)
                 for index, target in zip(translated_indices, translated):
                     targets[index] = target
-                self.last_batch_turn = turn
-                self.last_batch_indices = list(translated_indices)
-                return targets
+                return TranslationBatchResult(
+                    targets=targets,
+                    continuation=BatchContinuation(
+                        transcript=turn,
+                        translated_indices=list(translated_indices),
+                        native_handle=native_handle,
+                    ),
+                )
             except AlignmentError as error:
-                # 只恢复模型输出协议/对齐错误；传输错误已由 provider 统一处理。
                 self._log_rejected_response(
                     error,
                     attempt=attempt,
@@ -260,11 +300,8 @@ class Translator(Agent):
                     mode="batch",
                     next_action="retry_batch" if attempt < attempts else "fallback_per_segment",
                 )
-                continue
 
-        # 兜底：逐段翻译前清空整批 transcript
-        self.last_batch_turn = None
-        self.last_batch_indices = None
+        # 兜底逐段翻译不会创建原生会话，避免生成无法安全合并的多个 handle。
         targets = list(sources)
         for index, source, annotation_context in zip(
             translated_indices,
@@ -301,4 +338,34 @@ class Translator(Agent):
                     f"逐段兜底翻译在第 {index} 段失败",
                     reason="single_fallback_error",
                 ) from error
-        return targets
+        return TranslationBatchResult(targets)
+
+    def translate_batch(
+        self,
+        sources: list[str],
+        *,
+        glossary_terms: list[GlossaryTerm] | None = None,
+        style: str = "",
+        context: str = "",
+        book_synopsis: str = "",
+        chapter_digest: str = "",
+        annotation_contexts: list[list[dict[str, str]]] | None = None,
+        next_source: str = "",
+    ) -> list[str]:
+        """兼容旧调用：返回译文，并保留 transcript 诊断属性。"""
+        self.last_batch_turn = None
+        self.last_batch_indices = None
+        result = self.translate_batch_result(
+            sources,
+            glossary_terms=glossary_terms,
+            style=style,
+            context=context,
+            book_synopsis=book_synopsis,
+            chapter_digest=chapter_digest,
+            annotation_contexts=annotation_contexts,
+            next_source=next_source,
+        )
+        if result.continuation is not None:
+            self.last_batch_turn = result.continuation.transcript
+            self.last_batch_indices = result.continuation.translated_indices
+        return result.targets

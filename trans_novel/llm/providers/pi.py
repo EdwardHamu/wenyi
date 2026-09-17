@@ -11,7 +11,7 @@ pi 是带工具/上下文发现的 coding agent，翻译只需要纯文本回答
   不加载扩展、技能、提示词模板与 AGENTS.md/CLAUDE.md 上下文，避免把 coding
   agent 的默认上下文和「信任项目文件」的交互确认带进翻译请求，也避免每次
   请求重新拉起用户全局配置的扩展进程；
-- `--no-session`：不落盘会话（每次调用都是独立、可重复的一次性请求）；
+- 普通调用使用 `--no-session`；翻译后立即润色时才创建批次私有 session；
 - `--mode json`：输出 JSON 事件流，便于解析回复文本与用量。
 
 鉴权完全依赖本机 pi 的登录态/已配置的模型提供商，不需要 API key / base_url。
@@ -19,8 +19,10 @@ pi 是带工具/上下文发现的 coding agent，翻译只需要纯文本回答
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
+import re
 import shutil
 import smtplib
 import sys
@@ -28,8 +30,11 @@ import tempfile
 import threading
 import time
 import traceback
+import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from email.message import EmailMessage
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -44,7 +49,14 @@ from tenacity import (
 )
 
 from ...config import LLMConfig
-from ..base import LLMClient, Messages
+from ..base import (
+    ConversationCompletion,
+    LLMClient,
+    Messages,
+    NativeConversation,
+    NativeConversationInvalidError,
+    conversation_fingerprint,
+)
 from ..tiers import resolve_tier
 from ..usage import UsageSample, read_usage_int
 from ._cli import (
@@ -58,6 +70,14 @@ _JSON_MODE_INSTRUCTION = "Return only valid JSON, with no markdown fence or expl
 PI_ERROR_LOG_FILE = "pi_errors.log"
 _PI_ERROR_LOGGED_ATTRIBUTE = "_pi_error_logged"
 _PI_ERROR_LOG_LOCK = threading.Lock()
+_PI_502_STATUS_CODE_RE = re.compile(
+    r"(?:\bstatus(?:[\s_-]*code)?\s*(?::|=|is)?\s*502\b"
+    r"|\b502\s+status(?:[\s_-]+code)?\b"
+    r"|\bHTTP(?:/\d(?:\.\d)?)?\s+502\b"
+    r"|\b502\s+Bad\s+Gateway\b"
+    r"|\b(?:API|server|request)\s+error\s*\(\s*502\s*\))",
+    re.IGNORECASE,
+)
 
 PI_ALERT_MAIL_CONFIG_FILE = "pi_alert_mail.yaml"
 PI_AUDIT_NOTIFY_URL = "https://meamoe.top/koa/notify"
@@ -65,6 +85,8 @@ AUDIT_ALERT_TOTAL_TIMEOUT = 15.0
 
 _PROMPT_TEMP_FILES: set[str] = set()
 _PROMPT_TEMP_FILES_LOCK = threading.Lock()
+_SESSION_TEMP_DIRS: set[str] = set()
+_SESSION_TEMP_DIRS_LOCK = threading.Lock()
 
 
 def _register_prompt_temp_file(path: str) -> None:
@@ -89,6 +111,47 @@ def _cleanup_all_prompt_temp_files() -> None:
             _append_pi_error_raw(f"清理临时 prompt 文件失败 ({path}): {type(err).__name__}: {err}")
 
 
+def _register_session_temp_dir(path: str) -> None:
+    with _SESSION_TEMP_DIRS_LOCK:
+        _SESSION_TEMP_DIRS.add(path)
+
+
+def _unregister_session_temp_dir(path: str) -> None:
+    with _SESSION_TEMP_DIRS_LOCK:
+        _SESSION_TEMP_DIRS.discard(path)
+
+
+def _cleanup_session_temp_dir(path: str) -> None:
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        pass
+    _unregister_session_temp_dir(path)
+
+
+def _cleanup_all_session_temp_dirs() -> None:
+    with _SESSION_TEMP_DIRS_LOCK:
+        paths = list(_SESSION_TEMP_DIRS)
+        _SESSION_TEMP_DIRS.clear()
+    failed_paths: list[str] = []
+    for path in paths:
+        try:
+            shutil.rmtree(path)
+        except FileNotFoundError:
+            pass
+        except OSError as err:
+            failed_paths.append(path)
+            _append_pi_error_raw(
+                f"清理 Pi session 临时目录失败 ({path}): {type(err).__name__}: {err}"
+            )
+    if failed_paths:
+        with _SESSION_TEMP_DIRS_LOCK:
+            _SESSION_TEMP_DIRS.update(failed_paths)
+
+
+atexit.register(_cleanup_all_session_temp_dirs)
+
+
 def _pi_error_log_path() -> str:
     """Return the single append-only Pi error log path."""
     if os.path.isabs(PI_ERROR_LOG_FILE):
@@ -111,8 +174,12 @@ def _append_pi_error_raw(text: str) -> None:
         pass
 
 
+def _pi_error_text_requires_failover(error_text: str) -> bool:
+    return "审计" in error_text or _PI_502_STATUS_CODE_RE.search(error_text) is not None
+
+
 def _pi_error_contains_audit(error: BaseException) -> bool:
-    """Traverse error and explicit cause/context chain to check for '审计'."""
+    """Traverse an error chain for an audit or HTTP 502 failover signal."""
     visited: set[int] = set()
     stack: list[BaseException] = [error]
     while stack:
@@ -121,7 +188,12 @@ def _pi_error_contains_audit(error: BaseException) -> bool:
             continue
         visited.add(id(curr))
         error_text = f"{type(curr).__name__}: {curr}"
-        if "审计" in error_text:
+        response = getattr(curr, "response", None)
+        if (
+            getattr(curr, "status_code", None) == 502
+            or getattr(response, "status_code", None) == 502
+            or _pi_error_text_requires_failover(error_text)
+        ):
             return True
         if curr.__cause__ is not None:
             stack.append(curr.__cause__)
@@ -260,7 +332,7 @@ def _send_audit_email(
 
 
 def _hard_exit_after_audit() -> None:
-    """Terminates active processes, cleans up prompt files, and immediately exits."""
+    """Terminates active processes, cleans up temporary resources, and immediately exits."""
     try:
         terminate_all_active_processes()
     except Exception as err:
@@ -269,6 +341,10 @@ def _hard_exit_after_audit() -> None:
         _cleanup_all_prompt_temp_files()
     except Exception as err:
         _append_pi_error_raw(f"清理 prompt 临时文件失败: {type(err).__name__}: {err}")
+    try:
+        _cleanup_all_session_temp_dirs()
+    except Exception as err:
+        _append_pi_error_raw(f"清理 Pi session 临时目录失败: {type(err).__name__}: {err}")
     os._exit(1)
 
 
@@ -285,6 +361,7 @@ def _reset_audit_alert_state_for_testing() -> None:
         _AUDIT_COMPLETED_EVENT = threading.Event()
     with _PROMPT_TEMP_FILES_LOCK:
         _PROMPT_TEMP_FILES.clear()
+    _cleanup_all_session_temp_dirs()
 
 
 def _record_audit_notification_failure(channel: str, err: BaseException) -> None:
@@ -409,7 +486,7 @@ def _handle_audit_error(
 
 
 class PiAuditError(RuntimeError):
-    """Pi 内容审计异常类型化信号，用于优先级客户端自动切换。"""
+    """Pi 内容审计或 HTTP 502 异常信号，用于优先级客户端自动切换。"""
 
     pass
 
@@ -503,6 +580,16 @@ class PiTierOptions(BaseModel):
     # pi 的思考档位：off | minimal | low | medium | high | xhigh | max。
     # 字段名沿用其它 provider 的 reasoning_effort。
     reasoning_effort: str = "high"
+
+
+@dataclass(frozen=True, slots=True)
+class _PiConversationPayload:
+    cli_path: str
+    session_dir: str
+    session_file: str
+    system_prompt: str
+    extra_argv: tuple[str, ...]
+    json_mode: bool
 
 
 def _default_tiers() -> dict[str, ResolvedTier[PiTierOptions]]:
@@ -605,8 +692,10 @@ def parse_pi_events(
     raise_on_audit = bool(log_context.pop("raise_on_audit", False))
 
     def fail(message: str, cause: BaseException | None = None) -> None:
-        is_audit = "审计" in message or (cause is not None and _pi_error_contains_audit(cause))
-        if raise_on_audit and is_audit:
+        requires_failover = _pi_error_text_requires_failover(message) or (
+            cause is not None and _pi_error_contains_audit(cause)
+        )
+        if raise_on_audit and requires_failover:
             error = PiAuditError(message)
         else:
             error = RuntimeError(message)
@@ -687,6 +776,30 @@ def parse_pi_events(
         raise
 
 
+def _validate_pi_session_file(session_dir: str, session_id: str) -> str:
+    """返回私有目录内 header ID 精确匹配的 Pi JSONL session 文件。"""
+    root = Path(session_dir).resolve(strict=True)
+    for candidate in sorted(root.rglob("*.jsonl")):
+        try:
+            resolved = candidate.resolve(strict=True)
+            if candidate.is_symlink() or root not in resolved.parents:
+                continue
+            with resolved.open("r", encoding="utf-8") as session_file:
+                first_line = session_file.readline()
+            header = json.loads(first_line)
+        except (OSError, ValueError, TypeError):
+            continue
+        if (
+            isinstance(header, dict)
+            and header.get("type") == "session"
+            and header.get("id") == session_id
+        ):
+            return str(resolved)
+    raise NativeConversationInvalidError(
+        "Pi did not persist a session file with the requested exact session ID"
+    )
+
+
 class PiClient(LLMClient):
     """通过本机已登录的 `pi` CLI（pi -p ...）调用底层模型。
 
@@ -749,6 +862,316 @@ class PiClient(LLMClient):
                     )
                 self._cli_path = path
         return self._cli_path
+
+    @staticmethod
+    def _native_argv(
+        cli_path: str,
+        extra_argv: list[str] | tuple[str, ...],
+        session_argv: list[str],
+    ) -> list[str]:
+        return (
+            [cli_path, "-p", "--no-tools"]
+            + session_argv
+            + [
+                "--no-extensions",
+                "--no-context-files",
+                "--no-skills",
+                "--no-prompt-templates",
+                "--mode",
+                "json",
+            ]
+            + list(extra_argv)
+        )
+
+    def _run_native_attempt(
+        self,
+        argv: list[str],
+        *,
+        stdin_text: str,
+        system_prompt: str,
+        cwd: str,
+        request_id: int,
+        tier: str,
+        stage: str | None,
+        attempt: int,
+        json_mode: bool,
+    ) -> str:
+        """执行一次会话式 Pi 调用；调用方决定是否以及如何重试。"""
+        proc = None
+        system_prompt_file: str | None = None
+        run_argv = list(argv)
+        try:
+            if system_prompt:
+                fd, system_prompt_file = tempfile.mkstemp(suffix=".txt")
+                _register_prompt_temp_file(system_prompt_file)
+                with os.fdopen(fd, "w", encoding="utf-8") as prompt_file:
+                    prompt_file.write(system_prompt)
+                run_argv += ["--system-prompt", system_prompt_file]
+            with self.request_status(
+                tier=tier,
+                stage=stage,
+                request_id=request_id,
+                attempt=attempt,
+            ):
+                proc = run_cli_process(
+                    run_argv,
+                    input_text=stdin_text,
+                    timeout=self.cfg.timeout,
+                    provider="pi",
+                    cwd=cwd,
+                )
+                if proc.returncode != 0:
+                    err_msg = f"pi CLI 退出码非 0（{proc.returncode}）：{proc.stderr[:500]}"
+                    if self.raise_on_audit and _pi_error_contains_audit(RuntimeError(err_msg)):
+                        raise PiAuditError(err_msg)
+                    raise RuntimeError(err_msg)
+                text, sample = parse_pi_events(
+                    proc.stdout,
+                    error_context={
+                        "request_id": request_id,
+                        "tier": tier,
+                        "stage": stage,
+                        "attempt": attempt,
+                        "json_mode": json_mode,
+                        "argv": run_argv,
+                        "stderr": proc.stderr,
+                        "raise_on_audit": self.raise_on_audit,
+                    },
+                )
+                self.usage.record(tier, sample, stage, provider=self.provider_name)
+                return text
+        except Exception as caught:
+            error: BaseException = caught
+            if self.raise_on_audit and _pi_error_contains_audit(caught):
+                if not isinstance(caught, PiAuditError):
+                    error = PiAuditError(str(caught))
+                    error.__cause__ = caught
+                    error.__suppress_context__ = True
+            if not getattr(error, _PI_ERROR_LOGGED_ATTRIBUTE, False):
+                stdout = getattr(proc, "stdout", None)
+                if stdout is None:
+                    stdout = getattr(caught, "stdout", None) or getattr(caught, "output", None)
+                stderr = getattr(proc, "stderr", None)
+                if stderr is None:
+                    stderr = getattr(caught, "stderr", None)
+                _log_pi_error(
+                    error,
+                    operation="pi_cli_attempt",
+                    request_id=request_id,
+                    tier=tier,
+                    stage=stage,
+                    attempt=attempt,
+                    json_mode=json_mode,
+                    argv=run_argv,
+                    stdout=stdout,
+                    stderr=stderr,
+                    raise_on_audit=self.raise_on_audit,
+                )
+            if error is not caught:
+                raise error from caught
+            raise
+        finally:
+            if system_prompt_file is not None:
+                _unregister_prompt_temp_file(system_prompt_file)
+                had_active_error = sys.exc_info()[0] is not None
+                try:
+                    os.remove(system_prompt_file)
+                except FileNotFoundError:
+                    pass
+                except OSError as error:
+                    _log_pi_error(
+                        error,
+                        operation="pi_temp_file_cleanup",
+                        request_id=request_id,
+                        tier=tier,
+                        stage=stage,
+                        attempt=attempt,
+                        json_mode=json_mode,
+                        argv=run_argv,
+                    )
+                    if not had_active_error:
+                        raise
+
+    def start_conversation(
+        self,
+        messages: Messages,
+        *,
+        tier: str = "strong",
+        json_mode: bool = False,
+        max_tokens: Optional[int] = None,
+        stage: Optional[str] = None,
+    ) -> ConversationCompletion:
+        del max_tokens
+        request_id = self._new_request_id()
+        tier_config = resolve_tier(self.tiers, tier)
+        extra_argv, system_prompt, stdin_text = build_pi_invocation(
+            tier_config,
+            messages,
+            json_mode=json_mode,
+        )
+        cli_path = self._ensure_cli_path(tier_config)
+        cwd = os.path.abspath(os.getcwd())
+        attempt = 0
+
+        @retry(
+            stop=stop_after_attempt(self.cfg.max_retries + 1),
+            wait=wait_exponential(multiplier=1, max=30),
+            retry=retry_if_exception_type(Exception) & retry_if_not_exception_type(PiAuditError),
+            reraise=True,
+        )
+        def _call_fresh() -> ConversationCompletion:
+            nonlocal attempt
+            attempt += 1
+            session_id = str(uuid.uuid4())
+            session_dir = tempfile.mkdtemp(prefix="wenyi-pi-session-")
+            try:
+                os.chmod(session_dir, 0o700)
+            except OSError:
+                pass
+            _register_session_temp_dir(session_dir)
+            argv = self._native_argv(
+                cli_path,
+                extra_argv,
+                ["--session-id", session_id, "--session-dir", session_dir],
+            )
+            try:
+                text = self._run_native_attempt(
+                    argv,
+                    stdin_text=stdin_text,
+                    system_prompt=system_prompt,
+                    cwd=cwd,
+                    request_id=request_id,
+                    tier=tier,
+                    stage=stage,
+                    attempt=attempt,
+                    json_mode=json_mode,
+                )
+                session_file = _validate_pi_session_file(session_dir, session_id)
+            except BaseException:
+                try:
+                    _cleanup_session_temp_dir(session_dir)
+                except OSError as cleanup_error:
+                    _log_pi_error(
+                        cleanup_error,
+                        operation="pi_session_cleanup",
+                        request_id=request_id,
+                        tier=tier,
+                        stage=stage,
+                        attempt=attempt,
+                    )
+                raise
+            handle = NativeConversation(
+                provider=self.provider_name,
+                config_index=self.config_index,
+                tier=tier,
+                model=tier_config.model,
+                native_id=session_id,
+                cwd=cwd,
+                prefix_hash=conversation_fingerprint(messages),
+                _owner=self,
+                payload=_PiConversationPayload(
+                    cli_path=cli_path,
+                    session_dir=session_dir,
+                    session_file=session_file,
+                    system_prompt=system_prompt,
+                    extra_argv=tuple(extra_argv),
+                    json_mode=json_mode,
+                ),
+            )
+            self.emit_event(
+                "native_session_started",
+                provider=self.provider_name,
+                model=tier_config.model,
+                config_index=handle.config_index,
+                session_id_hash=handle.id_hash,
+            )
+            return ConversationCompletion(text=text, handle=handle, request_id=request_id)
+
+        try:
+            return _call_fresh()
+        except Exception as error:
+            if not getattr(error, _PI_ERROR_LOGGED_ATTRIBUTE, False):
+                _log_pi_error(
+                    error,
+                    operation="pi_start_conversation",
+                    request_id=request_id,
+                    tier=tier,
+                    stage=stage,
+                    attempt=attempt or None,
+                    json_mode=json_mode,
+                    raise_on_audit=self.raise_on_audit,
+                )
+            raise
+
+    def continue_conversation(
+        self,
+        handle: NativeConversation,
+        user_message: str,
+        *,
+        json_mode: bool = False,
+        max_tokens: Optional[int] = None,
+        stage: Optional[str] = None,
+    ) -> ConversationCompletion:
+        del max_tokens
+        handle.claim(self)
+        request_id = self._new_request_id()
+        payload = handle.payload
+        try:
+            if not isinstance(payload, _PiConversationPayload):
+                raise NativeConversationInvalidError("invalid Pi conversation payload")
+            if payload.json_mode != json_mode:
+                raise NativeConversationInvalidError(
+                    "Pi conversation JSON mode cannot change during continuation"
+                )
+            session_file = _validate_pi_session_file(payload.session_dir, handle.native_id)
+            if os.path.normcase(session_file) != os.path.normcase(payload.session_file):
+                raise NativeConversationInvalidError("Pi session file changed after creation")
+            if not os.path.isdir(handle.cwd):
+                raise NativeConversationInvalidError(
+                    "Pi conversation working directory no longer exists"
+                )
+            argv = self._native_argv(
+                payload.cli_path,
+                payload.extra_argv,
+                ["--session", session_file, "--session-dir", payload.session_dir],
+            )
+            # 原生 continuation 非幂等：同一 handle 只执行这一次，不套 tenacity。
+            text = self._run_native_attempt(
+                argv,
+                stdin_text=user_message,
+                system_prompt=payload.system_prompt,
+                cwd=handle.cwd,
+                request_id=request_id,
+                tier=handle.tier,
+                stage=stage,
+                attempt=1,
+                json_mode=json_mode,
+            )
+            return ConversationCompletion(text=text, request_id=request_id)
+        finally:
+            self.close_conversation(handle)
+
+    def close_conversation(self, handle: NativeConversation) -> None:
+        first_close = handle.mark_closed(self)
+        if not first_close:
+            return
+        payload = handle.payload
+        if isinstance(payload, _PiConversationPayload):
+            try:
+                _cleanup_session_temp_dir(payload.session_dir)
+            except OSError as error:
+                _log_pi_error(
+                    error,
+                    operation="pi_session_cleanup",
+                    tier=handle.tier,
+                )
+        self.emit_event(
+            "native_session_closed",
+            provider=self.provider_name,
+            model=handle.model,
+            config_index=handle.config_index,
+            session_id_hash=handle.id_hash,
+        )
 
     def complete(
         self,
@@ -838,22 +1261,23 @@ class PiClient(LLMClient):
                         )
                         self.usage.record(tier, sample, stage, provider=self.provider_name)
                         return text
-                except Exception as error:
-                    if self.raise_on_audit and _pi_error_contains_audit(error):
-                        if not isinstance(error, PiAuditError):
-                            audit_err = PiAuditError(str(error))
-                            audit_err.__cause__ = error
+                except Exception as caught:
+                    error: BaseException = caught
+                    if self.raise_on_audit and _pi_error_contains_audit(caught):
+                        if not isinstance(caught, PiAuditError):
+                            audit_err = PiAuditError(str(caught))
+                            audit_err.__cause__ = caught
                             audit_err.__suppress_context__ = True
                             error = audit_err
                     if not getattr(error, _PI_ERROR_LOGGED_ATTRIBUTE, False):
                         stdout = getattr(proc, "stdout", None)
                         if stdout is None:
-                            stdout = getattr(error, "stdout", None) or getattr(
-                                error, "output", None
+                            stdout = getattr(caught, "stdout", None) or getattr(
+                                caught, "output", None
                             )
                         stderr = getattr(proc, "stderr", None)
                         if stderr is None:
-                            stderr = getattr(error, "stderr", None)
+                            stderr = getattr(caught, "stderr", None)
                         _log_pi_error(
                             error,
                             operation="pi_cli_attempt",
@@ -867,6 +1291,8 @@ class PiClient(LLMClient):
                             stderr=stderr,
                             raise_on_audit=self.raise_on_audit,
                         )
+                    if error is not caught:
+                        raise error from caught
                     raise
 
             return _call()

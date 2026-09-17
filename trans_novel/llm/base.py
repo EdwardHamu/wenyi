@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from threading import Lock, local
 from typing import Any, Iterator
 
@@ -26,6 +29,108 @@ from .usage import UsageTracker
 Messages = list[dict[str, str]]
 EventSink = Callable[..., None]
 _LOGGER = logging.getLogger(__name__)
+
+
+class NativeConversationError(RuntimeError):
+    """原生 provider 会话不可安全继续。"""
+
+
+class NativeConversationUnsupportedError(NativeConversationError):
+    """当前 provider 不支持原生会话续接。"""
+
+
+class NativeConversationInvalidError(NativeConversationError):
+    """会话 handle 已失效、已消费或属于其它 client。"""
+
+
+class NativeConversationBusyError(NativeConversationInvalidError):
+    """同一会话正在被另一个线程消费。"""
+
+
+class NativeConversationRouteChangedError(NativeConversationInvalidError):
+    """优先级或 provider 路由已变化，不能再声称续接原会话。"""
+
+
+def conversation_fingerprint(messages: Messages) -> str:
+    """仅返回消息前缀哈希，供 handle 校验和无正文日志使用。"""
+    payload = json.dumps(messages, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+@dataclass(slots=True)
+class NativeConversation:
+    """一次翻译批次独占、最多消费一次的 provider opaque 会话 handle。"""
+
+    provider: str
+    config_index: int
+    tier: str
+    model: str
+    native_id: str
+    cwd: str
+    prefix_hash: str
+    _owner: object = field(repr=False, compare=False)
+    payload: Any = field(default=None, repr=False, compare=False)
+    _state: str = field(default="open", init=False, repr=False, compare=False)
+    _consumer_thread_id: int | None = field(default=None, init=False, repr=False, compare=False)
+    _state_lock: Lock = field(default_factory=Lock, init=False, repr=False, compare=False)
+
+    @property
+    def state(self) -> str:
+        with self._state_lock:
+            return self._state
+
+    @property
+    def id_hash(self) -> str:
+        return hashlib.sha256(self.native_id.encode("utf-8")).hexdigest()[:16]
+
+    def belongs_to(self, owner: object) -> bool:
+        return self._owner is owner
+
+    def claim(self, owner: object) -> None:
+        """原子地取得该一次性 handle；并发或重复消费直接拒绝。"""
+        with self._state_lock:
+            if self._owner is not owner:
+                raise NativeConversationInvalidError(
+                    "native conversation belongs to another client"
+                )
+            if self._state == "in_use":
+                raise NativeConversationBusyError("native conversation is already in use")
+            if self._state != "open":
+                raise NativeConversationInvalidError("native conversation is already closed")
+            self._state = "in_use"
+            self._consumer_thread_id = threading.get_ident()
+
+    def mark_closed(self, owner: object) -> bool:
+        """幂等关闭，返回本次调用是否首次完成关闭。"""
+        with self._state_lock:
+            if self._owner is not owner:
+                raise NativeConversationInvalidError(
+                    "native conversation belongs to another client"
+                )
+            if self._state == "closed":
+                return False
+            if self._state == "in_use" and self._consumer_thread_id != threading.get_ident():
+                raise NativeConversationBusyError(
+                    "native conversation can only be closed by its active consumer"
+                )
+            self._state = "closed"
+            self._consumer_thread_id = None
+            return True
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationCompletion:
+    text: str
+    handle: NativeConversation | None = None
+    request_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class JsonConversationCompletion:
+    data: Any
+    text: str
+    handle: NativeConversation | None = None
+    request_id: int | None = None
 
 
 class LLMClient(ABC):
@@ -223,6 +328,132 @@ class LLMClient(ABC):
 
     def validate_credentials(self, tiers: Sequence[str] | None = None) -> None:
         """校验 provider 调用所需凭据；本地或测试 provider 默认免检。"""
+
+    def owns_conversation(self, handle: NativeConversation) -> bool:
+        """返回 handle 是否由当前 client 直接拥有；路由 client 会递归覆盖。"""
+        return handle.belongs_to(self)
+
+    def start_conversation(
+        self,
+        messages: Messages,
+        *,
+        tier: str = "strong",
+        json_mode: bool = False,
+        max_tokens: int | None = None,
+        stage: str | None = None,
+    ) -> ConversationCompletion:
+        """请求 provider 创建原生会话；不支持时保持普通 complete 语义。"""
+        text = self.complete(
+            messages,
+            tier=tier,
+            json_mode=json_mode,
+            max_tokens=max_tokens,
+            stage=stage,
+        )
+        return ConversationCompletion(text=text, request_id=self._last_request_id())
+
+    def continue_conversation(
+        self,
+        handle: NativeConversation,
+        user_message: str,
+        *,
+        json_mode: bool = False,
+        max_tokens: int | None = None,
+        stage: str | None = None,
+    ) -> ConversationCompletion:
+        """仅发送新增 user turn；默认 provider 明确报告不支持。"""
+        del handle, user_message, json_mode, max_tokens, stage
+        raise NativeConversationUnsupportedError(
+            f"{self.provider_name or type(self).__name__} does not support native conversations"
+        )
+
+    def close_conversation(self, handle: NativeConversation) -> None:
+        """幂等释放直接拥有的 handle；provider 可覆盖以删除本地资源。"""
+        handle.mark_closed(self)
+
+    def _parse_conversation_json(
+        self,
+        completion: ConversationCompletion,
+        *,
+        tier: str,
+        stage: str | None,
+    ) -> JsonConversationCompletion:
+        """解析带 handle 的文本结果，并沿用 complete_json 的诊断契约。"""
+        text = completion.text
+        request_id = completion.request_id or self._last_request_id() or self._new_request_id()
+        self._request_context.last_json_response = text
+        self._request_context.last_json_request_id = request_id
+        try:
+            data = parse_json_loose(text)
+        except Exception as error:
+            self._notify_complete_json_error(
+                error,
+                request_id=request_id,
+                tier=tier,
+                stage=stage,
+            )
+            try:
+                self._on_complete_json_error(
+                    error,
+                    text,
+                    request_id=request_id,
+                    tier=tier,
+                    stage=stage,
+                )
+            except Exception:
+                pass
+            if completion.handle is not None:
+                try:
+                    self.close_conversation(completion.handle)
+                except Exception:
+                    pass
+            raise
+        return JsonConversationCompletion(
+            data=data,
+            text=text,
+            handle=completion.handle,
+            request_id=request_id,
+        )
+
+    def start_json_conversation(
+        self,
+        messages: Messages,
+        *,
+        tier: str = "strong",
+        max_tokens: int | None = None,
+        stage: str | None = None,
+    ) -> JsonConversationCompletion:
+        """创建会话并解析首轮 JSON；不支持的 provider 返回 handle=None。"""
+        self._request_context.last_json_response = None
+        self._request_context.last_json_request_id = None
+        completion = self.start_conversation(
+            messages,
+            tier=tier,
+            json_mode=True,
+            max_tokens=max_tokens,
+            stage=stage,
+        )
+        return self._parse_conversation_json(completion, tier=tier, stage=stage)
+
+    def continue_json_conversation(
+        self,
+        handle: NativeConversation,
+        user_message: str,
+        *,
+        max_tokens: int | None = None,
+        stage: str | None = None,
+    ) -> JsonConversationCompletion:
+        """在原生会话追加一轮 user 并解析 JSON。"""
+        self._request_context.last_json_response = None
+        self._request_context.last_json_request_id = None
+        completion = self.continue_conversation(
+            handle,
+            user_message,
+            json_mode=True,
+            max_tokens=max_tokens,
+            stage=stage,
+        )
+        return self._parse_conversation_json(completion, tier=handle.tier, stage=stage)
 
     @abstractmethod
     def complete(

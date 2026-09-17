@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import unittest
 from unittest.mock import patch
 
@@ -65,6 +66,58 @@ class TestPriorityLLMClient(unittest.TestCase):
         self.assertEqual(len(downgrades), 1)
         self.assertEqual(downgrades[0]["from_index"], 0)
         self.assertEqual(downgrades[0]["to_index"], 1)
+
+    @patch("trans_novel.llm.priority._dispatch_audit_notifications")
+    def test_pi_502_status_error_immediately_uses_next_provider(self, mock_dispatch):
+        config = Config.from_dict(
+            {
+                "llm_priority": "01",
+                "llm_list": [
+                    {
+                        "provider": "pi",
+                        "cli_path": "pi",
+                        "max_retries": 3,
+                        "tiers": {"strong": {"model": "m"}},
+                    },
+                    {"provider": "fake"},
+                ],
+            }
+        )
+        client = PriorityLLMClient(config)
+        client._clients[1].handler = lambda m, t, j: "备用 provider 回复"
+        call_count = 0
+
+        def fake_run(argv, *, input_text=None, timeout=None, provider=None):
+            nonlocal call_count
+            call_count += 1
+
+            class Result:
+                returncode = 0
+                stdout = json.dumps(
+                    {
+                        "type": "message_end",
+                        "message": {
+                            "role": "assistant",
+                            "content": [],
+                            "stopReason": "error",
+                            "errorMessage": "API Error: 502 status code (no body)",
+                        },
+                    }
+                )
+                stderr = ""
+
+            return Result()
+
+        with (
+            patch("trans_novel.llm.providers.pi.run_cli_process", side_effect=fake_run),
+            patch("trans_novel.llm.providers.pi._log_pi_error"),
+        ):
+            result = client.complete([{"role": "user", "content": "hello"}])
+
+        self.assertEqual(result, "备用 provider 回复")
+        self.assertEqual(call_count, 1)
+        self.assertEqual(client.current_config_index, 1)
+        mock_dispatch.assert_called_once()
 
     @patch("trans_novel.llm.priority._dispatch_audit_notifications")
     def test_ordinary_errors_do_not_switch(self, mock_dispatch):

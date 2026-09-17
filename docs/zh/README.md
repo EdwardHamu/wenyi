@@ -137,7 +137,7 @@ output:
 
 - **`llm_list`**：1–10 项完整的 provider 配置，按列表位置从 **0** 编号。每项独立设置 `provider`、`cli_path`、`timeout`（秒）、`max_retries` 与 `tiers`。
 - **`llm_priority`**：必须是带引号的字符串，且每个配置索引恰好出现一次。三项配置时，`"021"` 表示先用第 0 项，再到第 2 项、最后第 1 项；不是模型权重，也不是档位名。单项写 `"0"`，省略则按列表顺序生成。重复、遗漏或越界索引均不合法。
-- **不是通用故障切换**：当前多配置调度器针对 `PiAuditError` 自动切换，并非所有超时、登录错误或 provider 失败都会切换。距上次记录的审计事件满 600 秒后，后续请求可以恢复首选配置。启动前应确保全部配置使用的 Agent 已安装且可用，不能依靠备用项来代替环境配置。
+- **不是通用故障切换**：当前多配置调度器在 Pi 报告内容审计失败或 HTTP 502 状态错误时自动切换（两者均转换为 `PiAuditError`），并非所有超时、登录错误或 provider 失败都会切换。距上次触发切换的事件满 600 秒后，后续请求可以恢复首选配置。启动前应确保全部配置使用的 Agent 已安装且可用，不能依靠备用项来代替环境配置。
 - **`tiers.strong / cheap / fast`**：是 Wenyi 的流程角色，不是 CLI 子命令，也不保证真实价格高低。`strong` 用于分析、正文翻译和润色；`cheap` 用于初审、注释对齐；`fast` 用于章节梗概、全书概要。Review Agent/Fixer 还受 `pipeline.review_agent_tier` 控制。建议显式填写三档，即使全部使用同一个模型。
 - **Pi 选项映射**：`model` 原样传给 `pi --model`，可以是 Pi 能识别的模型 ID 或 `provider/model` 选择器。Wenyi 的 `provider: pi` 选中的是 CLI 适配器，不是底层模型厂商。`thinking: true` 将 `reasoning_effort` 传给 `--thinking`；`thinking: false` 则发送 `--thinking off`。思考档位必须由你本机的 Pi 版本与模型支持。
 - **`cli_path` 只填可执行文件路径**，不要填 `pi -p --model ...` 整条命令。省略时从 `PATH` 查找。Pi、Codex、Claude Code、CodeBuddy、Agy 的鉴权由对应 CLI 自身负责，Wenyi 的 `base_url` / `api_key_env` 不用于配置这些 CLI 适配器。原有 HTTP provider 仍可使用，并按各自规则读取连接字段。

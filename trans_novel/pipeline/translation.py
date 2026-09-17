@@ -779,7 +779,7 @@ class TranslationService:
         """
         sources = [s.source for s in batch]
         translator = self._runtime.translator
-        targets = translator.translate_batch(
+        translation_result = translator.translate_batch_result(
             sources,
             glossary_terms=terms,
             style=style,
@@ -788,35 +788,52 @@ class TranslationService:
             chapter_digest=chapter_digest,
             annotation_contexts=annotation_contexts,
             next_source=next_source,
+            capture_conversation=self._runtime.config.pipeline.polish,
         )
-        # 模型偶发把源文注音标记〘假名〙抄进译文时剥掉。
-        targets = [strip_ruby_markers(target) for target in targets]
+        continuation = translation_result.continuation
+        native_handle = continuation.native_handle if continuation is not None else None
+        try:
+            # 模型偶发把源文注音标记〘假名〙抄进译文时剥掉。
+            targets = [strip_ruby_markers(target) for target in translation_result.targets]
 
-        if self._runtime.config.pipeline.polish:
-            for segment, target in zip(batch, targets):
-                segment.target_before_polish = target
-            turn = translator.last_batch_turn
-            indices = translator.last_batch_indices
-            polished: list[str] | None = None
-            if turn is not None and indices is not None:
-                continued = self._runtime.polisher.polish_continue(
-                    turn,
-                    n=len(indices),
-                    next_source=next_source,
-                )
-                if continued is not None and len(continued) == len(indices):
-                    polished = list(targets)
-                    for index, text in zip(indices, continued):
-                        polished[index] = strip_ruby_markers(text)
-            if polished is None:
-                polished = self._runtime.polisher.polish(
-                    targets, glossary_terms=terms, style=style, next_source=next_source
-                )
-            if len(polished) == len(targets):
-                targets = polished
-        else:
-            # 段落可能在修改配置后被重译，不应沿用旧的润色前快照。
-            for segment in batch:
-                segment.target_before_polish = None
+            if self._runtime.config.pipeline.polish:
+                for segment, target in zip(batch, targets):
+                    segment.target_before_polish = target
+                polished: list[str] | None = None
+                if continuation is not None:
+                    indices = continuation.translated_indices
+                    continued = self._runtime.polisher.polish_continue(
+                        continuation.transcript,
+                        n=len(indices),
+                        next_source=next_source,
+                        native_handle=native_handle,
+                    )
+                    if continued is not None and len(continued) == len(indices):
+                        polished = list(targets)
+                        for index, text in zip(indices, continued):
+                            polished[index] = strip_ruby_markers(text)
+                if polished is None:
+                    polished = self._runtime.polisher.polish(
+                        targets, glossary_terms=terms, style=style, next_source=next_source
+                    )
+                if len(polished) == len(targets):
+                    targets = polished
+            else:
+                # 段落可能在修改配置后被重译，不应沿用旧的润色前快照。
+                for segment in batch:
+                    segment.target_before_polish = None
 
-        return targets
+            return targets
+        finally:
+            if native_handle is not None:
+                try:
+                    translator.client.close_conversation(native_handle)
+                except Exception as error:
+                    translator.client.emit_event(
+                        "native_session_close_failed",
+                        provider=native_handle.provider,
+                        model=native_handle.model,
+                        config_index=native_handle.config_index,
+                        session_id_hash=native_handle.id_hash,
+                        error_type=type(error).__name__,
+                    )

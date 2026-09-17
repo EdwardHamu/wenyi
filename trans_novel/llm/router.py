@@ -6,7 +6,15 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 from ..config import Config, TierConfig
-from .base import LLMClient, Messages, RequestEvent
+from .base import (
+    ConversationCompletion,
+    JsonConversationCompletion,
+    LLMClient,
+    Messages,
+    NativeConversation,
+    NativeConversationInvalidError,
+    RequestEvent,
+)
 from .tiers import resolve_tier_name
 
 
@@ -66,6 +74,98 @@ class RoutedLLMClient(LLMClient):
         super().set_status_listener(listener)
         for client in self.sub_clients.values():
             client.set_status_listener(listener)
+
+    def owns_conversation(self, handle: NativeConversation) -> bool:
+        return any(client.owns_conversation(handle) for client in self.sub_clients.values())
+
+    def _conversation_client(self, handle: NativeConversation) -> LLMClient:
+        matches = [
+            client for client in self.sub_clients.values() if client.owns_conversation(handle)
+        ]
+        if len(matches) != 1:
+            raise NativeConversationInvalidError("native conversation is not owned by this router")
+        return matches[0]
+
+    def start_conversation(
+        self,
+        messages: Messages,
+        *,
+        tier: str = "strong",
+        json_mode: bool = False,
+        max_tokens: int | None = None,
+        stage: str | None = None,
+    ) -> ConversationCompletion:
+        effective_tier = resolve_tier_name(self.tiers, tier)
+        prov = self._tier_to_provider[effective_tier]
+        return self.sub_clients[prov].start_conversation(
+            messages,
+            tier=effective_tier,
+            json_mode=json_mode,
+            max_tokens=max_tokens,
+            stage=stage,
+        )
+
+    def start_json_conversation(
+        self,
+        messages: Messages,
+        *,
+        tier: str = "strong",
+        max_tokens: int | None = None,
+        stage: str | None = None,
+    ) -> JsonConversationCompletion:
+        effective_tier = resolve_tier_name(self.tiers, tier)
+        prov = self._tier_to_provider[effective_tier]
+        client = self.sub_clients[prov]
+        try:
+            return client.start_json_conversation(
+                messages,
+                tier=effective_tier,
+                max_tokens=max_tokens,
+                stage=stage,
+            )
+        finally:
+            self._request_context.last_json_response = client.last_json_response()
+            self._request_context.last_json_request_id = client.last_json_request_id()
+
+    def continue_conversation(
+        self,
+        handle: NativeConversation,
+        user_message: str,
+        *,
+        json_mode: bool = False,
+        max_tokens: int | None = None,
+        stage: str | None = None,
+    ) -> ConversationCompletion:
+        return self._conversation_client(handle).continue_conversation(
+            handle,
+            user_message,
+            json_mode=json_mode,
+            max_tokens=max_tokens,
+            stage=stage,
+        )
+
+    def continue_json_conversation(
+        self,
+        handle: NativeConversation,
+        user_message: str,
+        *,
+        max_tokens: int | None = None,
+        stage: str | None = None,
+    ) -> JsonConversationCompletion:
+        client = self._conversation_client(handle)
+        try:
+            return client.continue_json_conversation(
+                handle,
+                user_message,
+                max_tokens=max_tokens,
+                stage=stage,
+            )
+        finally:
+            self._request_context.last_json_response = client.last_json_response()
+            self._request_context.last_json_request_id = client.last_json_request_id()
+
+    def close_conversation(self, handle: NativeConversation) -> None:
+        self._conversation_client(handle).close_conversation(handle)
 
     def complete(
         self,
